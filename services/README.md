@@ -9,6 +9,7 @@ services/
     Cargo.toml
     src/main.rs
     config/service.json
+    openapi.json
 ```
 
 ## Convenciones
@@ -17,6 +18,9 @@ services/
   con `200 OK`. El runner consulta esta ruta cada cinco segundos para actualizar el panel.
 * **Configuración**: el archivo `config/service.json` define el prefijo de enrutamiento y la URL
   base (incluyendo el puerto).
+* **Documentación OpenAPI**: cada servicio debe incluir un `openapi.json` sencillo con la lista de
+  rutas que ofrece. El runner valida cada petición entrante contra esta definición antes de
+  reenviarla al servicio correspondiente.
 * **Ejecución local**: cada servicio puede iniciarse de forma independiente con `cargo run` desde
   su carpeta, aunque el runner se encarga de hacerlo automáticamente cuando está disponible.
 
