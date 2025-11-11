@@ -1,4 +1,7 @@
 {
   "prefix": "bye",
-  "url": "http://127.0.0.1:15002"
+  "url": "http://127.0.0.1:15002",
+  "listeners": [
+    { "hello.notifications": "/events/hello" }
+  ]
 }

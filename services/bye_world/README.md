@@ -10,6 +10,7 @@ identificándose como `bye`.
 | GET    | `/hello`     | Devuelve un saludo genérico indicando la identidad del servicio. |
 | GET    | `/bye`       | Respuesta con un mensaje de despedida.        |
 | GET    | `/health`    | Devuelve `ok` y estado `200` para comprobaciones de vida. |
+| POST   | `/events/hello` | Registra eventos recibidos desde la cola interna `hello.notifications`. |
 
 ## Configuración
 

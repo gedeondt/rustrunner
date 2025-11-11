@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +14,7 @@ pub struct Service {
     pub prefix: String,
     pub base_url: String,
     pub allowed_get_endpoints: HashSet<String>,
+    pub queue_listeners: Vec<ServiceQueueListener>,
     pub schedules: Vec<ServiceSchedule>,
 }
 
@@ -29,10 +30,18 @@ impl Service {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceQueueListener {
+    pub queue: String,
+    pub path: String,
+}
+
 #[derive(Deserialize)]
 struct RawServiceConfig {
     prefix: String,
     url: String,
+    #[serde(default)]
+    listeners: Vec<HashMap<String, String>>,
     #[serde(default)]
     schedules: Vec<RawScheduleConfig>,
 }
@@ -108,10 +117,13 @@ pub fn load_services() -> Result<Vec<Service>> {
         let RawServiceConfig {
             prefix,
             url,
+            listeners,
             schedules: raw_schedules,
         } = read_service_config(&name)?;
 
         let allowed_get_endpoints = read_service_openapi(&name)?;
+        let queue_listeners = parse_queue_listeners(&name, &listeners)
+            .with_context(|| format!("failed to parse queue listeners for service '{}'", name))?;
         let schedules = normalize_service_schedules(&name, &allowed_get_endpoints, &raw_schedules)?;
 
         services.push(Service {
@@ -119,6 +131,7 @@ pub fn load_services() -> Result<Vec<Service>> {
             prefix,
             base_url: url,
             allowed_get_endpoints,
+            queue_listeners,
             schedules,
         });
     }
@@ -175,6 +188,54 @@ fn validate_service_config(name: &str, config: &RawServiceConfig) -> Result<()> 
     }
 
     Ok(())
+}
+
+fn parse_queue_listeners(
+    service_name: &str,
+    raw_listeners: &[HashMap<String, String>],
+) -> Result<Vec<ServiceQueueListener>> {
+    let mut listeners = Vec::new();
+
+    for entry in raw_listeners {
+        if entry.len() != 1 {
+            bail!(
+                "listener entries for service '{}' must contain exactly one queue mapping",
+                service_name
+            );
+        }
+
+        for (queue, path) in entry {
+            let queue = queue.trim();
+            if queue.is_empty() {
+                bail!(
+                    "listener for service '{}' declares an empty queue name",
+                    service_name
+                );
+            }
+
+            let path = path.trim();
+            if path.is_empty() {
+                bail!(
+                    "listener for service '{}' declares an empty callback path",
+                    service_name
+                );
+            }
+
+            if !path.starts_with('/') {
+                bail!(
+                    "listener for service '{}' must declare callback paths starting with '/'",
+                    service_name
+                );
+            }
+
+            listeners.push(ServiceQueueListener {
+                queue: queue.to_string(),
+                path: path.to_string(),
+            });
+        }
+    }
+
+    Ok(listeners)
 }
 
 fn read_service_openapi(name: &str) -> Result<HashSet<String>> {
@@ -355,6 +416,7 @@ fn collect_get_endpoints(document: &Value) -> Result<HashSet<String>> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashMap;
     use tiny_http::Method;
 
     #[test]
@@ -364,6 +426,7 @@ mod tests {
             prefix: "foo".into(),
             base_url: "http://localhost".into(),
             allowed_get_endpoints: ["ping".into()].into_iter().collect(),
+            queue_listeners: Vec::new(),
             schedules: Vec::new(),
         };
 
@@ -408,6 +471,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_queue_listeners_enforcing_invariants() {
+        let listeners = vec![HashMap::from([(
+            String::from("queue"),
+            String::from("/hook"),
+        )])];
+        let parsed = parse_queue_listeners("demo", &listeners).expect("parse listeners");
+
+        assert_eq!(
+            parsed,
+            vec![ServiceQueueListener {
+                queue: "queue".into(),
+                path: "/hook".into(),
+            }]
+        );
+
+        let invalid = vec![HashMap::from([(String::from(""), String::from("/hook"))])];
+        assert!(parse_queue_listeners("demo", &invalid).is_err());
+
+        let invalid_path = vec![HashMap::from([(
+            String::from("queue"),
+            String::from("hook"),
+        )])];
+        assert!(parse_queue_listeners("demo", &invalid_path).is_err());
     fn parse_schedule_entries_from_multiple_formats() {
         let raw: Vec<RawScheduleConfig> = serde_json::from_value(json!([
             ["/ping", 30],

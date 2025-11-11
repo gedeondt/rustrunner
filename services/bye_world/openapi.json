@@ -35,6 +35,16 @@
           }
         }
       }
+    },
+    "/events/hello": {
+      "post": {
+        "summary": "Recibe eventos publicados en la cola hello.notifications",
+        "responses": {
+          "202": {
+            "description": "Evento aceptado."
+          }
+        }
+      }
     }
   }
 }

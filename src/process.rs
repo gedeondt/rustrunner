@@ -313,6 +313,7 @@ mod tests {
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
             allowed_get_endpoints: Default::default(),
+            queue_listeners: Vec::new(),
             schedules: Vec::new(),
         };
 

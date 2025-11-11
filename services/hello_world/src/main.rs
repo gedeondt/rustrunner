@@ -2,7 +2,9 @@ use std::io::Write;
 
 use env_logger::{Builder, Env, Target};
 use log::{debug, error, info, warn};
+use serde_json::json;
 use tiny_http::{Method, Request, Response, Server};
+use ureq::Error;
 
 #[derive(Debug, PartialEq, Eq)]
 struct EndpointResponse {
@@ -12,6 +14,8 @@ struct EndpointResponse {
 
 const IDENTITY: &str = "hello";
 const PORT: u16 = 15001;
+const QUEUE_NAME: &str = "hello.notifications";
+const RUNNER_QUEUE_ENDPOINT: &str = "http://127.0.0.1:14000/__runner__/queues/hello.notifications";
 
 fn main() {
     Builder::from_env(Env::default().default_filter_or("info"))
@@ -95,7 +99,58 @@ fn dispatch_endpoint(endpoint: &str) -> Option<EndpointResponse> {
             status: 200,
             body: "ok".into(),
         }),
+        "notify" => Some(match publish_greeting_event() {
+            Ok(message) => EndpointResponse {
+                status: 202,
+                body: message,
+            },
+            Err(error) => EndpointResponse {
+                status: 500,
+                body: error,
+            },
+        }),
         _ => None,
+    }
+}
+
+fn publish_greeting_event() -> Result<String, String> {
+    let payload = json!({
+        "queue": QUEUE_NAME,
+        "message": "Hola desde hello",
+        "origin": IDENTITY,
+    });
+
+    match ureq::post(RUNNER_QUEUE_ENDPOINT)
+        .set("Content-Type", "application/json")
+        .send_string(&payload.to_string())
+    {
+        Ok(response) => {
+            let status = response.status();
+            let body = response
+                .into_string()
+                .unwrap_or_else(|_| String::from(""));
+
+            if (200..300).contains(&status) {
+                if body.is_empty() {
+                    Ok("Evento publicado correctamente".into())
+                } else {
+                    Ok(format!("Evento publicado: {}", body))
+                }
+            } else {
+                Err(format!("El runner devolvió un estado {}: {}", status, body))
+            }
+        }
+        Err(Error::Status(status, response)) => {
+            let body = response
+                .into_string()
+                .unwrap_or_else(|_| String::from(""));
+            Err(format!(
+                "El runner rechazó el evento ({}): {}",
+                status,
+                body
+            ))
+        }
+        Err(error) => Err(format!("No se pudo publicar el evento: {error}")),
     }
 }
 

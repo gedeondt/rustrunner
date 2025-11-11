@@ -7,6 +7,7 @@ use tiny_http::{Header, Method, Request, Response, Server};
 use crate::config::Service;
 use crate::health::{HealthStatus, SharedHealthMap};
 use crate::logs::SharedLogMap;
+use crate::queue::{with_queue_registry, QueueSnapshot, SharedQueueRegistry};
 use crate::scheduler::{self, ScheduleState, SharedScheduleMap, ToggleError};
 use crate::stats::{record_http_status, SharedStats};
 use serde_json::json;
@@ -19,6 +20,7 @@ pub fn run_server(
     logs: &SharedLogMap,
     schedules: &SharedScheduleMap,
     stats: &SharedStats,
+    queues: &SharedQueueRegistry,
 ) -> Result<()> {
     let server = Server::http(("0.0.0.0", ENTRY_PORT)).map_err(|error| {
         anyhow!(
@@ -31,6 +33,7 @@ pub fn run_server(
     println!("Runner listening on http://{}:{}", "0.0.0.0", ENTRY_PORT);
 
     for request in server.incoming_requests() {
+        if let Err(error) = handle_request(services, health, logs, stats, queues, request) {
         if let Err(error) = handle_request(services, health, logs, schedules, stats, request) {
             eprintln!("Failed to handle request: {:#}", error);
         }
@@ -45,14 +48,9 @@ fn handle_request(
     logs: &SharedLogMap,
     schedules: &SharedScheduleMap,
     stats: &SharedStats,
+    queues: &SharedQueueRegistry,
     request: Request,
 ) -> Result<()> {
-    if request.method() != &Method::Get {
-        let response = Response::from_string("method not allowed").with_status_code(405);
-        request.respond(response)?;
-        return Ok(());
-    }
-
     let full_path = request.url().to_owned();
     let (path, query) = match full_path.split_once('?') {
         Some((path, query)) => (path, Some(query)),
@@ -61,6 +59,22 @@ fn handle_request(
 
     let trimmed_path = path.trim_start_matches('/');
 
+    if request.method() == &Method::Post {
+        if let Some(queue_name) = trimmed_path.strip_prefix("__runner__/queues/") {
+            return handle_queue_publish(queues, request, queue_name);
+        }
+
+        let response = Response::from_string("not found").with_status_code(404);
+        request.respond(response)?;
+        return Ok(());
+    }
+
+    if request.method() != &Method::Get {
+        let response = Response::from_string("method not allowed").with_status_code(405);
+        request.respond(response)?;
+        return Ok(());
+    }
+
     if trimmed_path == "health" {
         let response = Response::from_string("ok").with_status_code(200);
         request.respond(response)?;
@@ -68,7 +82,7 @@ fn handle_request(
     }
 
     if trimmed_path.is_empty() {
-        let response = render_homepage(services, health, schedules);
+        let response = render_homepage(services, health, schedules, queues);
         request.respond(response)?;
         return Ok(());
     }
@@ -244,6 +258,14 @@ fn handle_internal_service_request(
     Ok(())
 }
 
+fn handle_queue_publish(
+    queues: &SharedQueueRegistry,
+    mut request: Request,
+    raw_queue_name: &str,
+) -> Result<()> {
+    let queue_name = raw_queue_name.trim();
+
+    if queue_name.is_empty() {
 fn handle_schedule_request(
     service_name: &str,
     schedules: &SharedScheduleMap,
@@ -256,6 +278,86 @@ fn handle_schedule_request(
         return Ok(());
     }
 
+    let content_type = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Content-Type"))
+        .map(|header| header.value.to_string());
+
+    let mut payload = Vec::new();
+    if let Err(error) = request.as_reader().read_to_end(&mut payload) {
+        eprintln!("Failed to read queue payload: {}", error);
+        let response = Response::from_string("invalid payload").with_status_code(500);
+        request.respond(response)?;
+        return Ok(());
+    }
+
+    let (subscribers, message_count) =
+        match with_queue_registry(queues, |registry| registry.prepare_delivery(queue_name)) {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("Failed to access queue registry: {error}");
+                let response = Response::from_string("queue unavailable").with_status_code(500);
+                request.respond(response)?;
+                return Ok(());
+            }
+        };
+
+    for subscriber in &subscribers {
+        let mut call = ureq::post(&subscriber.target_url).set("X-Rustrunner-Queue", queue_name);
+
+        if let Some(ref ct) = content_type {
+            call = call.set("Content-Type", ct);
+        } else {
+            call = call.set("Content-Type", "application/json");
+        }
+
+        if let Err(error) = call.send_bytes(&payload) {
+            eprintln!(
+                "Failed to deliver queue '{}' event to service '{}' at {}: {}",
+                queue_name, subscriber.service_name, subscriber.target_url, error
+            );
+        }
+    }
+
+    let response_body = serde_json::json!({
+        "queue": queue_name,
+        "subscribers": subscribers.len(),
+        "message_count": message_count,
+    })
+    .to_string();
+
+    let mut response = Response::from_string(response_body).with_status_code(202);
+    if let Ok(header) = Header::from_bytes(b"Content-Type", b"application/json; charset=utf-8") {
+        response = response.with_header(header);
+    }
+
+    request.respond(response)?;
+    Ok(())
+}
+
+fn render_queue_section(queues: &SharedQueueRegistry) -> String {
+    let snapshot = match with_queue_registry(queues, |registry| registry.snapshot()) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return "<p>No se pudo obtener el estado de las colas en este momento.</p>".to_string();
+        }
+    };
+
+    if snapshot.is_empty() {
+        return "<p>Aún no se han instanciado colas.</p>".to_string();
+    }
+
+    render_queue_table(&snapshot)
+}
+
+fn render_queue_table(snapshot: &[QueueSnapshot]) -> String {
+    let mut rows = String::new();
+
+    for queue in snapshot {
+        rows.push_str(&format!(
+            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+            queue.name, queue.subscriber_count, queue.message_count
     let index: usize = match remaining[0].parse() {
         Ok(value) => value,
         Err(_) => {
@@ -362,6 +464,17 @@ fn build_schedule_section(service_name: &str, entries: Option<&Vec<ScheduleState
 
     format!(
         concat!(
+            "<table>",
+            "  <thead>",
+            "    <tr><th>Cola</th><th>Suscriptores</th><th>Mensajes procesados</th></tr>",
+            "  </thead>",
+            "  <tbody>{}</tbody>",
+            "</table>"
+        ),
+        rows
+    )
+}
+
             "<div class=\"schedule-section\">",
             "  <h4>Webhooks programados</h4>",
             "  <ul class=\"schedule-list\">{items}</ul>",
@@ -434,6 +547,7 @@ fn build_response(upstream: ureq::Response) -> Result<Response<Cursor<Vec<u8>>>>
 fn render_homepage(
     services: &[Service],
     health: &SharedHealthMap,
+    queues: &SharedQueueRegistry,
     schedules: &SharedScheduleMap,
 ) -> Response<Cursor<Vec<u8>>> {
     let service_section = if services.is_empty() {
@@ -499,6 +613,8 @@ fn render_homepage(
         format!("<ul class=\"service-list\">{}</ul>", items)
     };
 
+    let queue_section = render_queue_section(queues);
+
     let html = format!(
         concat!(
             "<!DOCTYPE html>\n",
@@ -553,7 +669,9 @@ fn render_homepage(
             "        <button type=\"button\" id=\"stats-button\" class=\"icon-button\" title=\"Ver estadísticas\" aria-label=\"Ver estadísticas\">📈</button>\n",
             "      </div>\n",
             "        <p>Estos son los servicios registrados actualmente en el runner.</p>\n",
-            "        {service_section}\n",
+            "        {}\n",
+            "      <h2>Colas internas</h2>\n",
+            "        {}\n",
             "    </main>\n",
             "    <div id=\"modal\" class=\"modal\" hidden>\n",
             "      <div class=\"modal__dialog\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"modal-title\">\n",
@@ -794,7 +912,8 @@ fn render_homepage(
             "</body>\n",
             "</html>\n"
         ),
-        service_section = service_section
+        service_section,
+        queue_section
     );
 
     let mut response = Response::from_string(html);
@@ -816,6 +935,7 @@ mod tests {
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
             allowed_get_endpoints: Default::default(),
+            queue_listeners: Vec::new(),
             schedules: Vec::new(),
         };
         let services = vec![service];
@@ -834,6 +954,7 @@ mod tests {
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
             allowed_get_endpoints: Default::default(),
+            queue_listeners: Vec::new(),
             schedules: Vec::new(),
         };
         let services = vec![service];

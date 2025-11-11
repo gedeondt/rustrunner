@@ -35,6 +35,19 @@
           }
         }
       }
+    },
+    "/notify": {
+      "get": {
+        "summary": "Publica un evento en la cola interna hello.notifications",
+        "responses": {
+          "202": {
+            "description": "Evento publicado correctamente."
+          },
+          "500": {
+            "description": "El runner rechazó la publicación."
+          }
+        }
+      }
     }
   }
 }
