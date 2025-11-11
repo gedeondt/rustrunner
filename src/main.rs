@@ -1,15 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Cursor, ErrorKind};
+use std::io::{BufRead, BufReader, Cursor, ErrorKind};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
+use serde_json::Value;
 use tiny_http::{Header, Method, Request, Response, Server};
 use url::Url;
 
@@ -24,6 +25,13 @@ struct Service {
     name: String,
     prefix: String,
     base_url: String,
+    allowed_get_endpoints: HashSet<String>,
+}
+
+impl Service {
+    fn supports(&self, method: &Method, endpoint: &str) -> bool {
+        matches!(method, &Method::Get) && self.allowed_get_endpoints.contains(endpoint)
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -152,11 +160,13 @@ fn load_services() -> Result<Vec<Service>> {
         }
 
         let RawServiceConfig { prefix, url } = read_service_config(&name)?;
+        let allowed_get_endpoints = read_service_openapi(&name)?;
 
         services.push(Service {
             name,
             prefix,
             base_url: url,
+            allowed_get_endpoints,
         });
     }
 
@@ -188,8 +198,18 @@ fn start_service_processes(services: &[Service]) -> Result<Vec<ServiceGuard>> {
             .arg("run")
             .arg("--manifest-path")
             .arg(&manifest_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("failed to start service '{}' via cargo", service.name))?;
+
+        if let Some(stdout) = child.stdout.take() {
+            spawn_log_forwarder(service.name.clone(), stdout, "stdout");
+        }
+
+        if let Some(stderr) = child.stderr.take() {
+            spawn_log_forwarder(service.name.clone(), stderr, "stderr");
+        }
 
         match wait_for_service(service) {
             Ok(()) => {
@@ -214,6 +234,40 @@ fn start_service_processes(services: &[Service]) -> Result<Vec<ServiceGuard>> {
     }
 
     Ok(guards)
+}
+
+fn spawn_log_forwarder<R>(service_name: String, reader: R, stream_label: &'static str)
+where
+    R: std::io::Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let buffered = BufReader::new(reader);
+        for line in buffered.lines() {
+            match line {
+                Ok(line) => {
+                    let (level, message) = parse_service_log_line(&line)
+                        .map(|(level, message)| (level.to_string(), message.to_string()))
+                        .unwrap_or_else(|| (stream_label.to_uppercase(), line));
+                    println!("[svc:{}][{}] {}", service_name, level, message);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "failed to read {stream_label} from service '{}': {}",
+                        service_name, error
+                    );
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn parse_service_log_line(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    let (level, remainder) = rest.split_at(end);
+    let message = remainder.get(1..).unwrap_or_default().trim_start();
+    Some((level, message))
 }
 
 fn wait_for_service(service: &Service) -> Result<()> {
@@ -335,19 +389,27 @@ fn handle_request(services: &[Service], health: &SharedHealthMap, request: Reque
         return Ok(());
     };
 
-    let Some(endpoint) = segments.next() else {
-        let response = Response::from_string("not found").with_status_code(404);
-        request.respond(response)?;
-        return Ok(());
-    };
+    let endpoint_segments: Vec<_> = segments.collect();
 
-    if segments.next().is_some() {
+    if endpoint_segments.is_empty() {
         let response = Response::from_string("not found").with_status_code(404);
         request.respond(response)?;
         return Ok(());
     }
 
-    let mut target_url = format!("{}/{}", service.base_url.trim_end_matches('/'), endpoint);
+    let endpoint_path = endpoint_segments.join("/");
+
+    if !service.supports(request.method(), &endpoint_path) {
+        let response = Response::from_string("not found").with_status_code(404);
+        request.respond(response)?;
+        return Ok(());
+    }
+
+    let mut target_url = format!(
+        "{}/{}",
+        service.base_url.trim_end_matches('/'),
+        endpoint_path
+    );
 
     if let Some(query) = query {
         target_url.push('?');
@@ -511,6 +573,72 @@ fn config_path(name: &str) -> PathBuf {
 
 fn service_manifest_path(name: &str) -> PathBuf {
     PathBuf::from("services").join(name).join("Cargo.toml")
+}
+
+fn openapi_path(name: &str) -> PathBuf {
+    PathBuf::from("services").join(name).join("openapi.json")
+}
+
+fn read_service_openapi(name: &str) -> Result<HashSet<String>> {
+    let path = openapi_path(name);
+    let contents = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "failed to read OpenAPI specification for service '{}' at {}",
+            name,
+            path.display()
+        )
+    })?;
+
+    let document: Value = serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "failed to parse OpenAPI specification for service '{}' at {}",
+            name,
+            path.display()
+        )
+    })?;
+
+    let paths = document
+        .get("paths")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| {
+            anyhow!(
+                "OpenAPI specification for service '{}' missing 'paths' object",
+                name
+            )
+        })?;
+
+    let mut allowed = HashSet::new();
+
+    for (path_key, methods_value) in paths {
+        let Some(methods) = methods_value.as_object() else {
+            continue;
+        };
+
+        let allows_get = methods
+            .keys()
+            .any(|method| method.eq_ignore_ascii_case("get"));
+
+        if !allows_get {
+            continue;
+        }
+
+        let endpoint = path_key.trim_matches('/');
+
+        if endpoint.is_empty() {
+            continue;
+        }
+
+        allowed.insert(endpoint.to_string());
+    }
+
+    if allowed.is_empty() {
+        bail!(
+            "OpenAPI specification for service '{}' does not declare any GET endpoints",
+            name
+        );
+    }
+
+    Ok(allowed)
 }
 
 fn read_service_config(name: &str) -> Result<RawServiceConfig> {

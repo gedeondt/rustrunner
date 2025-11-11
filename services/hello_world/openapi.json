@@ -1,0 +1,40 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Hello World Service",
+    "version": "1.0.0",
+    "description": "Servicio de ejemplo que responde saludos sencillos."
+  },
+  "paths": {
+    "/hello": {
+      "get": {
+        "summary": "Devuelve un saludo",
+        "responses": {
+          "200": {
+            "description": "Saludo generado por el servicio."
+          }
+        }
+      }
+    },
+    "/bye": {
+      "get": {
+        "summary": "Devuelve una despedida",
+        "responses": {
+          "200": {
+            "description": "Despedida generada por el servicio."
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Verifica la salud del servicio",
+        "responses": {
+          "200": {
+            "description": "El servicio está disponible."
+          }
+        }
+      }
+    }
+  }
+}
