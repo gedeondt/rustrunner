@@ -28,14 +28,26 @@ build_module() {
 "$SCRIPT_DIR/check_wasm_toolchain.sh"
 
 if [ $# -eq 0 ]; then
-    mapfile -t modules < <(find services -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+    shopt -s nullglob
+    modules=()
+
+    for module_dir in services/*/; do
+        [ -d "$module_dir" ] || continue
+        module_dir="${module_dir%/}"
+        modules+=("${module_dir##*/}")
+    done
+
+    shopt -u nullglob
 
     if [ ${#modules[@]} -eq 0 ]; then
         echo "No service modules found under 'services'." >&2
         exit 1
     fi
 
-    for module in "${modules[@]}"; do
+    IFS=$'\n' modules_sorted=($(printf '%s\n' "${modules[@]}" | sort))
+    unset IFS
+
+    for module in "${modules_sorted[@]}"; do
         echo "Building module '$module'..."
         build_module "$module" || exit 1
     done
