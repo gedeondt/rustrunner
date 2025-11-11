@@ -12,6 +12,36 @@ use crate::logs::{spawn_log_forwarder, SharedLogMap};
 const SERVICE_STARTUP_ATTEMPTS: usize = 50;
 const SERVICE_STARTUP_BACKOFF_MS: u64 = 100;
 
+#[cfg(unix)]
+fn configure_memory_limit(command: &mut Command, limit_bytes: u64) {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        command.pre_exec(move || {
+            set_memory_limit(limit_bytes)?;
+            Ok(())
+        });
+    }
+}
+
+#[cfg(unix)]
+fn set_memory_limit(limit_bytes: u64) -> std::io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: limit_bytes as libc::rlim_t,
+        rlim_max: limit_bytes as libc::rlim_t,
+    };
+
+    let result = unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_memory_limit(_command: &mut Command, _limit_bytes: u64) {}
+
 pub struct ServiceGuard {
     name: String,
     child: Child,
@@ -62,18 +92,25 @@ pub fn start_service_processes(
         }
 
         let manifest_path = service_manifest_path(&service.name);
+        let memory_limit_mib = service.memory_limit_bytes / (1024 * 1024);
         println!(
-            "Starting service '{}' using manifest {}",
+            "Starting service '{}' using manifest {} (memory limit: {} MiB)",
             service.name,
-            manifest_path.display()
+            manifest_path.display(),
+            memory_limit_mib
         );
 
-        let mut child = Command::new("cargo")
+        let mut command = Command::new("cargo");
+        command
             .arg("run")
             .arg("--manifest-path")
             .arg(&manifest_path)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        configure_memory_limit(&mut command, service.memory_limit_bytes);
+
+        let mut child = command
             .spawn()
             .with_context(|| format!("failed to start service '{}' via cargo", service.name))?;
 
@@ -200,6 +237,7 @@ mod tests {
             name: "svc".into(),
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
+            memory_limit_bytes: 64 * 1024 * 1024,
             allowed_get_endpoints: Default::default(),
         };
 
