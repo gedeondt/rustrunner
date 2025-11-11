@@ -129,9 +129,9 @@ mod tests {
             name: name.into(),
             prefix: name.into(),
             base_url: url.into(),
-            memory_limit_bytes: 64,
             allowed_get_endpoints: HashSet::new(),
             queue_listeners: Vec::new(),
+            schedules: Vec::new(),
         }
     }
 
