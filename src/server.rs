@@ -8,8 +8,8 @@ use crate::config::Service;
 use crate::health::{HealthStatus, SharedHealthMap};
 use crate::logs::SharedLogMap;
 use crate::scheduler::{self, ScheduleState, SharedScheduleMap, ToggleError};
-use serde_json::json;
 use crate::stats::{record_http_status, SharedStats};
+use serde_json::json;
 
 const ENTRY_PORT: u16 = 14000;
 
@@ -31,8 +31,7 @@ pub fn run_server(
     println!("Runner listening on http://{}:{}", "0.0.0.0", ENTRY_PORT);
 
     for request in server.incoming_requests() {
-        if let Err(error) = handle_request(services, health, logs, schedules, request) {
-        if let Err(error) = handle_request(services, health, logs, stats, request) {
+        if let Err(error) = handle_request(services, health, logs, schedules, stats, request) {
             eprintln!("Failed to handle request: {:#}", error);
         }
     }
