@@ -10,6 +10,7 @@ cómo registrar un servicio en el runner y cómo exponer un healthcheck compatib
 | GET    | `/hello`     | Devuelve un saludo con la identidad del servicio. |
 | GET    | `/bye`       | Muestra un mensaje de despedida.              |
 | GET    | `/health`    | Responde siempre `200 OK` con cuerpo `ok`.    |
+| GET    | `/notify`    | Publica un evento en la cola interna `hello.notifications`. |
 
 ## Configuración
 

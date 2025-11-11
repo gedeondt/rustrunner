@@ -6,6 +6,7 @@ use tiny_http::{Method, Request, Response, Server};
 
 const IDENTITY: &str = "bye";
 const PORT: u16 = 15002;
+const HELLO_NOTIFICATIONS_QUEUE: &str = "hello.notifications";
 
 #[derive(Debug, PartialEq, Eq)]
 struct EndpointResponse {
@@ -34,17 +35,23 @@ fn main() {
 }
 
 fn handle_request(request: Request) -> Result<(), Box<dyn std::error::Error>> {
-    if request.method() != &Method::Get {
-        warn!(
-            "Rejecting request with unsupported method {:?} to {}",
-            request.method(),
-            request.url()
-        );
-        let response = Response::from_string("method not allowed").with_status_code(405);
-        request.respond(response)?;
-        return Ok(());
+    match *request.method() {
+        Method::Get => handle_get(request),
+        Method::Post => handle_post(request),
+        _ => {
+            warn!(
+                "Rejecting request with unsupported method {:?} to {}",
+                request.method(),
+                request.url()
+            );
+            let response = Response::from_string("method not allowed").with_status_code(405);
+            request.respond(response)?;
+            Ok(())
+        }
     }
+}
 
+fn handle_get(request: Request) -> Result<(), Box<dyn std::error::Error>> {
     let (path, _) = request.url().split_once('?').unwrap_or((request.url(), ""));
     let mut segments = path
         .trim_start_matches('/')
@@ -77,6 +84,42 @@ fn handle_request(request: Request) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+fn handle_post(mut request: Request) -> Result<(), Box<dyn std::error::Error>> {
+    let (path, _) = request.url().split_once('?').unwrap_or((request.url(), ""));
+    let normalized = path.trim_start_matches('/');
+
+    if normalized != "events/hello" {
+        let response = Response::from_string("not found").with_status_code(404);
+        request.respond(response)?;
+        return Ok(());
+    }
+
+    let mut body = String::new();
+    if let Err(error) = request.as_reader().read_to_string(&mut body) {
+        error!("No se pudo leer el payload del evento: {}", error);
+        let response = Response::from_string("invalid payload").with_status_code(500);
+        request.respond(response)?;
+        return Ok(());
+    }
+
+    let queue_name = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("X-Rustrunner-Queue"))
+        .map(|header| header.value.as_str())
+        .unwrap_or(HELLO_NOTIFICATIONS_QUEUE);
+
+    info!(
+        "Evento recibido en la cola '{}' con payload: {}",
+        queue_name,
+        body
+    );
+
+    let response = Response::from_string("accepted").with_status_code(202);
+    request.respond(response)?;
     Ok(())
 }
 

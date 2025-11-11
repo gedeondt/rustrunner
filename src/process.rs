@@ -239,6 +239,7 @@ mod tests {
             base_url: "http://localhost:1234".into(),
             memory_limit_bytes: 64 * 1024 * 1024,
             allowed_get_endpoints: Default::default(),
+            queue_listeners: Vec::new(),
         };
 
         let path = crate::config::service_manifest_path(&service.name);
