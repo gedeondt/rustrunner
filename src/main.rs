@@ -1,31 +1,28 @@
 use std::fs;
+use std::io::Cursor;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
-use tiny_http::{Request, Response, Server};
-use wasi_common::pipe::WritePipe;
-use wasmtime::{Engine, Linker, Module, Store};
-use wasmtime_wasi::sync::{add_to_linker, WasiCtxBuilder};
+use tiny_http::{Header, Method, Request, Response, Server};
 
-const WASM_TARGET: &str = "wasm32-wasip1";
 const ENTRY_PORT: u16 = 14000;
 const SERVICE_NAMES: &[&str] = &["hello_world", "bye_world"];
 
 struct Service {
     name: &'static str,
     prefix: String,
-    module: Module,
+    base_url: String,
 }
 
 #[derive(Deserialize)]
 struct RawServiceConfig {
     prefix: String,
+    url: String,
 }
 
 fn main() -> Result<()> {
-    let engine = Engine::default();
-    let services = load_services(&engine)?;
+    let services = load_services()?;
 
     let server = Server::http(("0.0.0.0", ENTRY_PORT)).map_err(|error| {
         anyhow!(
@@ -38,7 +35,7 @@ fn main() -> Result<()> {
     println!("Runner listening on http://{}:{}", "0.0.0.0", ENTRY_PORT);
 
     for request in server.incoming_requests() {
-        if let Err(error) = handle_request(&engine, &services, request) {
+        if let Err(error) = handle_request(&services, request) {
             eprintln!("Failed to handle request: {:#}", error);
         }
     }
@@ -46,41 +43,35 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn load_services(engine: &Engine) -> Result<Vec<Service>> {
+fn load_services() -> Result<Vec<Service>> {
     let mut services = Vec::new();
 
     for &name in SERVICE_NAMES {
-        let prefix = read_service_prefix(name)?;
-        let module_path = module_path(name);
-
-        if !module_path.exists() {
-            bail!(
-                "WebAssembly module not found at {}. Build it with scripts/build_wasm_module.sh {}",
-                module_path.display(),
-                name
-            );
-        }
-
-        let module = Module::from_file(engine, &module_path).with_context(|| {
-            format!(
-                "failed to load WebAssembly module '{}' from {}",
-                name,
-                module_path.display()
-            )
-        })?;
+        let RawServiceConfig { prefix, url } = read_service_config(name)?;
 
         services.push(Service {
             name,
             prefix,
-            module,
+            base_url: url,
         });
     }
 
     Ok(services)
 }
 
-fn handle_request(engine: &Engine, services: &[Service], request: Request) -> Result<()> {
-    let path = request.url().split('?').next().unwrap_or("");
+fn handle_request(services: &[Service], request: Request) -> Result<()> {
+    if request.method() != &Method::Get {
+        let response = Response::from_string("method not allowed").with_status_code(405);
+        request.respond(response)?;
+        return Ok(());
+    }
+
+    let full_path = request.url();
+    let (path, query) = match full_path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (full_path, None),
+    };
+
     let mut segments = path
         .trim_start_matches('/')
         .split('/')
@@ -110,58 +101,53 @@ fn handle_request(engine: &Engine, services: &[Service], request: Request) -> Re
         return Ok(());
     }
 
-    let args = [service.name, endpoint];
+    let mut target_url = format!(
+        "{}/{}",
+        service.base_url.trim_end_matches('/'),
+        endpoint
+    );
 
-    let response = match run_wasm_module(engine, &service.module, &args) {
-        Ok(body) => Response::from_string(body).with_status_code(200),
-        Err(error) => {
-            eprintln!("Error executing module '{}': {:#}", service.name, error);
-            Response::from_string("internal error").with_status_code(500)
+    if let Some(query) = query {
+        target_url.push('?');
+        target_url.push_str(query);
+    }
+
+    match ureq::request(request.method().as_str(), &target_url).call() {
+        Ok(response) => {
+            let response = build_response(response)?;
+            request.respond(response)?;
         }
-    };
+        Err(ureq::Error::Status(_, response)) => {
+            let response = build_response(response)?;
+            request.respond(response)?;
+        }
+        Err(error) => {
+            eprintln!(
+                "Error contacting service '{}': {}",
+                service.name, error
+            );
+            let response = Response::from_string("upstream error").with_status_code(502);
+            request.respond(response)?;
+        }
+    }
 
-    request.respond(response)?;
     Ok(())
 }
 
-fn run_wasm_module(engine: &Engine, module: &Module, args: &[&str]) -> Result<String> {
-    let mut linker = Linker::new(engine);
-    add_to_linker(&mut linker, |ctx| ctx)?;
+fn build_response(upstream: ureq::Response) -> Result<Response<Cursor<Vec<u8>>>> {
+    let status = upstream.status();
+    let content_type = upstream.header("Content-Type").map(|value| value.to_owned());
+    let body = upstream.into_string().context("failed to read upstream response body")?;
 
-    let stdout = WritePipe::new_in_memory();
-    let stdout_reader = stdout.clone();
+    let mut response = Response::from_string(body).with_status_code(status);
 
-    let argv: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    if let Some(content_type) = content_type {
+        if let Ok(header) = Header::from_bytes(b"Content-Type", content_type.as_bytes()) {
+            response = response.with_header(header);
+        }
+    }
 
-    let wasi_ctx = WasiCtxBuilder::new()
-        .args(&argv)?
-        .stdout(Box::new(stdout))
-        .inherit_stderr()
-        .build();
-
-    let mut store = Store::new(engine, wasi_ctx);
-    let instance = linker.instantiate(&mut store, module)?;
-    let start = instance
-        .get_typed_func::<(), ()>(&mut store, "_start")
-        .context("`_start` function not found in module")?;
-    start.call(&mut store, ())?;
-    drop(store);
-
-    let bytes = stdout_reader
-        .try_into_inner()
-        .map_err(|_| anyhow!("failed to read stdout from module"))?
-        .into_inner();
-    let output = String::from_utf8(bytes)?;
-    Ok(output.trim().to_owned())
-}
-
-fn module_path(name: &str) -> PathBuf {
-    PathBuf::from("services")
-        .join(name)
-        .join("target")
-        .join(WASM_TARGET)
-        .join("release")
-        .join(format!("{name}.wasm"))
+    Ok(response)
 }
 
 fn config_path(name: &str) -> PathBuf {
@@ -171,7 +157,7 @@ fn config_path(name: &str) -> PathBuf {
         .join("service.json")
 }
 
-fn read_service_prefix(name: &str) -> Result<String> {
+fn read_service_config(name: &str) -> Result<RawServiceConfig> {
     let path = config_path(name);
     let contents = fs::read_to_string(&path).with_context(|| {
         format!(
@@ -181,7 +167,7 @@ fn read_service_prefix(name: &str) -> Result<String> {
         )
     })?;
 
-    let RawServiceConfig { prefix } = serde_json::from_str(&contents).with_context(|| {
+    let config: RawServiceConfig = serde_json::from_str(&contents).with_context(|| {
         format!(
             "failed to parse configuration for service '{}' at {}",
             name,
@@ -189,9 +175,13 @@ fn read_service_prefix(name: &str) -> Result<String> {
         )
     })?;
 
-    if prefix.trim().is_empty() {
+    if config.prefix.trim().is_empty() {
         bail!("prefix for service '{}' cannot be empty", name);
     }
 
-    Ok(prefix)
+    if config.url.trim().is_empty() {
+        bail!("url for service '{}' cannot be empty", name);
+    }
+
+    Ok(config)
 }
