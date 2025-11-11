@@ -17,7 +17,6 @@ identificándose como `bye`.
 
 * `prefix`: `bye`. El runner expone sus rutas en `http://127.0.0.1:14000/bye/<endpoint>`.
 * `url`: `http://127.0.0.1:15002`, puerto local donde escucha el binario.
-* `memory_limit_mb`: `64`. Al arrancar, el runner limita el servicio a 64 MiB de memoria.
 
 ## Ejecución
 

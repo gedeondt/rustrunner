@@ -571,7 +571,6 @@ mod tests {
             name: "svc".into(),
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
-            memory_limit_bytes: 64 * 1024 * 1024,
             allowed_get_endpoints: Default::default(),
         };
         let services = vec![service];
@@ -589,7 +588,6 @@ mod tests {
             name: "svc".into(),
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
-            memory_limit_bytes: 64 * 1024 * 1024,
             allowed_get_endpoints: Default::default(),
         };
         let services = vec![service];
