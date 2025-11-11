@@ -1,123 +1,140 @@
+use std::fs;
 use std::path::PathBuf;
-use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tiny_http::{Response, Server};
+use serde::Deserialize;
+use tiny_http::{Request, Response, Server};
 use wasi_common::pipe::WritePipe;
 use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::sync::{add_to_linker, WasiCtxBuilder};
 
 const WASM_TARGET: &str = "wasm32-wasip1";
+const ENTRY_PORT: u16 = 14000;
+const SERVICE_NAMES: &[&str] = &["hello_world", "bye_world"];
 
-#[derive(Clone, Copy)]
-struct ServiceConfig {
+struct Service {
     name: &'static str,
-    port: u16,
+    prefix: String,
+    module: Module,
+}
+
+#[derive(Deserialize)]
+struct RawServiceConfig {
+    prefix: String,
 }
 
 fn main() -> Result<()> {
-    let services = [
-        ServiceConfig {
-            name: "hello_world",
-            port: 15000,
-        },
-        ServiceConfig {
-            name: "bye_world",
-            port: 15001,
-        },
-    ];
-
-    let mut handles = Vec::new();
-
-    for service in services {
-        let handle = thread::Builder::new()
-            .name(service.name.to_owned())
-            .spawn(move || run_service(service))
-            .with_context(|| format!("failed to spawn service '{}'", service.name))?;
-        handles.push(handle);
-    }
-
-    for handle in handles {
-        handle
-            .join()
-            .map_err(|err| anyhow!("service thread panicked: {err:?}"))??;
-    }
-
-    Ok(())
-}
-
-fn run_service(config: ServiceConfig) -> Result<()> {
-    let module_path = module_path(config.name);
-
-    if !module_path.exists() {
-        bail!(
-            "WebAssembly module not found at {}. Build it with scripts/build_wasm_module.sh {}",
-            module_path.display(),
-            config.name
-        );
-    }
-
     let engine = Engine::default();
-    let module = Module::from_file(&engine, &module_path).with_context(|| {
-        format!(
-            "failed to load WebAssembly module '{}' from {}",
-            config.name,
-            module_path.display()
-        )
-    })?;
+    let services = load_services(&engine)?;
 
-    let address = ("0.0.0.0", config.port);
-    let server = Server::http(address).map_err(|error| {
+    let server = Server::http(("0.0.0.0", ENTRY_PORT)).map_err(|error| {
         anyhow!(
-            "failed to bind service '{}' to port {}: {}",
-            config.name,
-            config.port,
+            "failed to bind entrypoint to port {}: {}",
+            ENTRY_PORT,
             error
         )
     })?;
 
-    println!(
-        "Service '{}' listening on http://{}:{}",
-        config.name, "0.0.0.0", config.port
-    );
+    println!("Runner listening on http://{}:{}", "0.0.0.0", ENTRY_PORT);
 
     for request in server.incoming_requests() {
-        let body = match run_wasm_module(&engine, &module) {
-            Ok(content) => content,
-            Err(error) => {
-                eprintln!("Error executing module '{}': {:#}", config.name, error);
-                String::from("internal error")
-            }
-        };
-
-        let response = Response::from_string(body).with_status_code(200);
-        if let Err(error) = request.respond(response) {
-            eprintln!(
-                "Service '{}' failed to respond to request: {}",
-                config.name, error
-            );
+        if let Err(error) = handle_request(&engine, &services, request) {
+            eprintln!("Failed to handle request: {:#}", error);
         }
     }
 
     Ok(())
 }
 
-fn module_path(name: &str) -> PathBuf {
-    PathBuf::from(format!(
-        "services/{name}/target/{target}/release/{name}.wasm",
-        name = name,
-        target = WASM_TARGET
-    ))
+fn load_services(engine: &Engine) -> Result<Vec<Service>> {
+    let mut services = Vec::new();
+
+    for &name in SERVICE_NAMES {
+        let prefix = read_service_prefix(name)?;
+        let module_path = module_path(name);
+
+        if !module_path.exists() {
+            bail!(
+                "WebAssembly module not found at {}. Build it with scripts/build_wasm_module.sh {}",
+                module_path.display(),
+                name
+            );
+        }
+
+        let module = Module::from_file(engine, &module_path).with_context(|| {
+            format!(
+                "failed to load WebAssembly module '{}' from {}",
+                name,
+                module_path.display()
+            )
+        })?;
+
+        services.push(Service {
+            name,
+            prefix,
+            module,
+        });
+    }
+
+    Ok(services)
 }
 
-fn run_wasm_module(engine: &Engine, module: &Module) -> Result<String> {
+fn handle_request(engine: &Engine, services: &[Service], request: Request) -> Result<()> {
+    let path = request.url().split('?').next().unwrap_or("");
+    let mut segments = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty());
+
+    let Some(prefix) = segments.next() else {
+        let response = Response::from_string("not found").with_status_code(404);
+        request.respond(response)?;
+        return Ok(());
+    };
+
+    let Some(service) = services.iter().find(|service| service.prefix == prefix) else {
+        let response = Response::from_string("not found").with_status_code(404);
+        request.respond(response)?;
+        return Ok(());
+    };
+
+    let Some(endpoint) = segments.next() else {
+        let response = Response::from_string("not found").with_status_code(404);
+        request.respond(response)?;
+        return Ok(());
+    };
+
+    if segments.next().is_some() {
+        let response = Response::from_string("not found").with_status_code(404);
+        request.respond(response)?;
+        return Ok(());
+    }
+
+    let args = [service.name, endpoint];
+
+    let response = match run_wasm_module(engine, &service.module, &args) {
+        Ok(body) => Response::from_string(body).with_status_code(200),
+        Err(error) => {
+            eprintln!("Error executing module '{}': {:#}", service.name, error);
+            Response::from_string("internal error").with_status_code(500)
+        }
+    };
+
+    request.respond(response)?;
+    Ok(())
+}
+
+fn run_wasm_module(engine: &Engine, module: &Module, args: &[&str]) -> Result<String> {
     let mut linker = Linker::new(engine);
     add_to_linker(&mut linker, |ctx| ctx)?;
 
     let stdout = WritePipe::new_in_memory();
     let stdout_reader = stdout.clone();
 
+    let argv: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+
     let wasi_ctx = WasiCtxBuilder::new()
+        .args(&argv)?
         .stdout(Box::new(stdout))
         .inherit_stderr()
         .build();
@@ -136,4 +153,45 @@ fn run_wasm_module(engine: &Engine, module: &Module) -> Result<String> {
         .into_inner();
     let output = String::from_utf8(bytes)?;
     Ok(output.trim().to_owned())
+}
+
+fn module_path(name: &str) -> PathBuf {
+    PathBuf::from("services")
+        .join(name)
+        .join("target")
+        .join(WASM_TARGET)
+        .join("release")
+        .join(format!("{name}.wasm"))
+}
+
+fn config_path(name: &str) -> PathBuf {
+    PathBuf::from("services")
+        .join(name)
+        .join("config")
+        .join("service.json")
+}
+
+fn read_service_prefix(name: &str) -> Result<String> {
+    let path = config_path(name);
+    let contents = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "failed to read configuration for service '{}' at {}",
+            name,
+            path.display()
+        )
+    })?;
+
+    let RawServiceConfig { prefix } = serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "failed to parse configuration for service '{}' at {}",
+            name,
+            path.display()
+        )
+    })?;
+
+    if prefix.trim().is_empty() {
+        bail!("prefix for service '{}' cannot be empty", name);
+    }
+
+    Ok(prefix)
 }
