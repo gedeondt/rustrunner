@@ -27,6 +27,12 @@ pub fn run() -> Result<()> {
     let stats = stats::initialize_stats_store();
     let queues = queue::initialize_queue_registry(&services);
 
-    server::run_server(&services, &health, &logs, &stats, &queues)
-    server::run_server(&services, &health, &logs, &schedules, &stats)
+    server::run_server(
+        &services,
+        &health,
+        &logs,
+        &schedules,
+        &stats,
+        &queues,
+    )
 }

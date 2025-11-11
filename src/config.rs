@@ -494,6 +494,9 @@ mod tests {
             String::from("hook"),
         )])];
         assert!(parse_queue_listeners("demo", &invalid_path).is_err());
+    }
+
+    #[test]
     fn parse_schedule_entries_from_multiple_formats() {
         let raw: Vec<RawScheduleConfig> = serde_json::from_value(json!([
             ["/ping", 30],

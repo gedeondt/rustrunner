@@ -33,8 +33,15 @@ pub fn run_server(
     println!("Runner listening on http://{}:{}", "0.0.0.0", ENTRY_PORT);
 
     for request in server.incoming_requests() {
-        if let Err(error) = handle_request(services, health, logs, stats, queues, request) {
-        if let Err(error) = handle_request(services, health, logs, schedules, stats, request) {
+        if let Err(error) = handle_request(
+            services,
+            health,
+            logs,
+            schedules,
+            stats,
+            queues,
+            request,
+        ) {
             eprintln!("Failed to handle request: {:#}", error);
         }
     }
@@ -82,7 +89,7 @@ fn handle_request(
     }
 
     if trimmed_path.is_empty() {
-        let response = render_homepage(services, health, schedules, queues);
+        let response = render_homepage(services, health, queues, schedules);
         request.respond(response)?;
         return Ok(());
     }
@@ -266,14 +273,7 @@ fn handle_queue_publish(
     let queue_name = raw_queue_name.trim();
 
     if queue_name.is_empty() {
-fn handle_schedule_request(
-    service_name: &str,
-    schedules: &SharedScheduleMap,
-    request: Request,
-    remaining: &[&str],
-) -> Result<()> {
-    if remaining.len() != 2 || remaining[1] != "toggle" {
-        let response = Response::from_string("not found").with_status_code(404);
+        let response = Response::from_string("invalid queue name").with_status_code(400);
         request.respond(response)?;
         return Ok(());
     }
@@ -304,7 +304,8 @@ fn handle_schedule_request(
         };
 
     for subscriber in &subscribers {
-        let mut call = ureq::post(&subscriber.target_url).set("X-Rustrunner-Queue", queue_name);
+        let mut call =
+            ureq::post(&subscriber.target_url).set("X-Rustrunner-Queue", queue_name);
 
         if let Some(ref ct) = content_type {
             call = call.set("Content-Type", ct);
@@ -320,7 +321,7 @@ fn handle_schedule_request(
         }
     }
 
-    let response_body = serde_json::json!({
+    let response_body = json!({
         "queue": queue_name,
         "subscribers": subscribers.len(),
         "message_count": message_count,
@@ -336,28 +337,18 @@ fn handle_schedule_request(
     Ok(())
 }
 
-fn render_queue_section(queues: &SharedQueueRegistry) -> String {
-    let snapshot = match with_queue_registry(queues, |registry| registry.snapshot()) {
-        Ok(snapshot) => snapshot,
-        Err(_) => {
-            return "<p>No se pudo obtener el estado de las colas en este momento.</p>".to_string();
-        }
-    };
-
-    if snapshot.is_empty() {
-        return "<p>Aún no se han instanciado colas.</p>".to_string();
+fn handle_schedule_request(
+    service_name: &str,
+    schedules: &SharedScheduleMap,
+    request: Request,
+    remaining: &[&str],
+) -> Result<()> {
+    if remaining.len() != 2 || remaining[1] != "toggle" {
+        let response = Response::from_string("not found").with_status_code(404);
+        request.respond(response)?;
+        return Ok(());
     }
 
-    render_queue_table(&snapshot)
-}
-
-fn render_queue_table(snapshot: &[QueueSnapshot]) -> String {
-    let mut rows = String::new();
-
-    for queue in snapshot {
-        rows.push_str(&format!(
-            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
-            queue.name, queue.subscriber_count, queue.message_count
     let index: usize = match remaining[0].parse() {
         Ok(value) => value,
         Err(_) => {
@@ -388,6 +379,46 @@ fn render_queue_table(snapshot: &[QueueSnapshot]) -> String {
     }
 
     Ok(())
+}
+
+fn render_queue_section(queues: &SharedQueueRegistry) -> String {
+    let snapshot = match with_queue_registry(queues, |registry| registry.snapshot()) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return "<p>No se pudo obtener el estado de las colas en este momento.</p>".to_string();
+        }
+    };
+
+    if snapshot.is_empty() {
+        return "<p>Aún no se han instanciado colas.</p>".to_string();
+    }
+
+    render_queue_table(&snapshot)
+}
+
+fn render_queue_table(snapshot: &[QueueSnapshot]) -> String {
+    let mut rows = String::new();
+
+    for queue in snapshot {
+        rows.push_str(&format!(
+            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+            escape_html(&queue.name),
+            queue.subscriber_count,
+            queue.message_count
+        ));
+    }
+
+    format!(
+        concat!(
+            "<table>",
+            "  <thead>",
+            "    <tr><th>Cola</th><th>Suscriptores</th><th>Mensajes procesados</th></tr>",
+            "  </thead>",
+            "  <tbody>{}</tbody>",
+            "</table>"
+        ),
+        rows
+    )
 }
 
 fn build_schedule_section(service_name: &str, entries: Option<&Vec<ScheduleState>>) -> String {
@@ -464,17 +495,6 @@ fn build_schedule_section(service_name: &str, entries: Option<&Vec<ScheduleState
 
     format!(
         concat!(
-            "<table>",
-            "  <thead>",
-            "    <tr><th>Cola</th><th>Suscriptores</th><th>Mensajes procesados</th></tr>",
-            "  </thead>",
-            "  <tbody>{}</tbody>",
-            "</table>"
-        ),
-        rows
-    )
-}
-
             "<div class=\"schedule-section\">",
             "  <h4>Webhooks programados</h4>",
             "  <ul class=\"schedule-list\">{items}</ul>",
