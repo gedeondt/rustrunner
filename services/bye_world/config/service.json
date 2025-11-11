@@ -1,7 +1,6 @@
 {
   "prefix": "bye",
   "url": "http://127.0.0.1:15002",
-  "memory_limit_mb": 64,
   "listeners": [
     { "hello.notifications": "/events/hello" }
   ]

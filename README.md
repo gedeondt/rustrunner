@@ -38,6 +38,26 @@ necesario.
    `GET /health` que responde con `200 OK`. El runner consulta este endpoint cada cinco segundos
    para actualizar el estado mostrado en el panel.
 
+## Webhooks programados
+
+Además del sondeo de salud, cada servicio puede declarar webhooks que el runner ejecutará de forma
+periódica. Basta con añadir el bloque `schedules` en `config/service.json`, por ejemplo:
+
+```json
+{
+  "prefix": "hello",
+  "url": "http://127.0.0.1:15001",
+  "memory_limit_mb": 64,
+  "schedules": [
+    { "endpoint": "/hello", "interval_secs": 60 }
+  ]
+}
+```
+
+Cada entrada indica la ruta (relativa al servicio) y el intervalo de ejecución en segundos. El
+panel del runner muestra todas las tareas programadas, el resultado HTTP de la última ejecución y
+permite pausarlas o reanudarlas individualmente.
+
 ## Estructura de carpetas
 
 | Carpeta | Descripción |

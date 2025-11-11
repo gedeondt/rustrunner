@@ -97,9 +97,9 @@ mod tests {
             name: "svc".into(),
             prefix: "svc".into(),
             base_url: "http://localhost:1234/".into(),
-            memory_limit_bytes: 64 * 1024 * 1024,
             allowed_get_endpoints: Default::default(),
             queue_listeners: Vec::new(),
+            schedules: Vec::new(),
         };
 
         assert_eq!(healthcheck_url(&service), "http://localhost:1234/health");
@@ -111,9 +111,9 @@ mod tests {
             name: "svc".into(),
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
-            memory_limit_bytes: 64 * 1024 * 1024,
             allowed_get_endpoints: Default::default(),
             queue_listeners: Vec::new(),
+            schedules: Vec::new(),
         };
 
         let health = start_health_monitor(&[service.clone()]);
