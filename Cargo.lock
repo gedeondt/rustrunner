@@ -1258,6 +1258,8 @@ name = "rustrunner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde",
+ "serde_json",
  "tiny_http",
  "wasi-common",
  "wasmtime",
