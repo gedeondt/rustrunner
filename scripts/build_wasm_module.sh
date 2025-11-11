@@ -2,29 +2,48 @@
 set -euo pipefail
 
 TARGET="wasm32-wasip1"
+SCRIPT_DIR="$(dirname "$0")"
 
-if [ $# -ne 1 ]; then
-    echo "Usage: $0 <module-name>" >&2
-    exit 1
-fi
+build_module() {
+    local module_name="$1"
+    local module_dir="services/$module_name"
 
-MODULE_NAME="$1"
-MODULE_DIR="services/$MODULE_NAME"
+    if [ ! -d "$module_dir" ]; then
+        echo "Module directory '$module_dir' does not exist." >&2
+        return 1
+    fi
 
-if [ ! -d "$MODULE_DIR" ]; then
-    echo "Module directory '$MODULE_DIR' does not exist." >&2
-    exit 1
-fi
+    cargo build --target "$TARGET" --release --manifest-path "$module_dir/Cargo.toml"
 
-"$(dirname "$0")/check_wasm_toolchain.sh"
+    local wasm_path="$module_dir/target/${TARGET}/release/$module_name.wasm"
 
-cargo build --target "$TARGET" --release --manifest-path "$MODULE_DIR/Cargo.toml"
+    if [ -f "$wasm_path" ]; then
+        echo "Built WebAssembly module at $wasm_path"
+    else
+        echo "Failed to build WebAssembly module for $module_name" >&2
+        return 1
+    fi
+}
 
-WASM_PATH="$MODULE_DIR/target/${TARGET}/release/$MODULE_NAME.wasm"
+"$SCRIPT_DIR/check_wasm_toolchain.sh"
 
-if [ -f "$WASM_PATH" ]; then
-    echo "Built WebAssembly module at $WASM_PATH"
+if [ $# -eq 0 ]; then
+    mapfile -t modules < <(find services -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+
+    if [ ${#modules[@]} -eq 0 ]; then
+        echo "No service modules found under 'services'." >&2
+        exit 1
+    fi
+
+    for module in "${modules[@]}"; do
+        echo "Building module '$module'..."
+        build_module "$module" || exit 1
+    done
 else
-    echo "Failed to build WebAssembly module for $MODULE_NAME" >&2
-    exit 1
+    if [ $# -ne 1 ]; then
+        echo "Usage: $0 [<module-name>]" >&2
+        exit 1
+    fi
+
+    build_module "$1" || exit 1
 fi

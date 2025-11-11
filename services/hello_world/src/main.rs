@@ -4,6 +4,12 @@ use env_logger::{Builder, Env, Target};
 use log::{debug, error, info, warn};
 use tiny_http::{Method, Request, Response, Server};
 
+#[derive(Debug, PartialEq, Eq)]
+struct EndpointResponse {
+    status: u16,
+    body: String,
+}
+
 const IDENTITY: &str = "hello";
 const PORT: u16 = 15001;
 
@@ -59,25 +65,54 @@ fn handle_request(request: Request) -> Result<(), Box<dyn std::error::Error>> {
 
     debug!("Dispatching endpoint '{}'", endpoint);
 
-    let response = match endpoint {
-        "hello" => {
-            info!("Procesando endpoint /hello");
-            Response::from_string(format!("Soy {IDENTITY} y digo hello"))
-                .with_status_code(200)
+    match dispatch_endpoint(endpoint) {
+        Some(result) => {
+            info!("Procesando endpoint /{}", endpoint);
+            request
+                .respond(Response::from_string(result.body).with_status_code(result.status))?;
         }
-        "bye" => {
-            info!("Procesando endpoint /bye");
-            Response::from_string(format!("Soy {IDENTITY} y digo bye")).with_status_code(200)
-        }
-        "health" => Response::from_string("ok").with_status_code(200),
-        _ => {
+        None => {
             warn!("Endpoint desconocido '{}'", endpoint);
             let response = Response::from_string("not found").with_status_code(404);
             request.respond(response)?;
-            return Ok(());
         }
-    };
+    }
 
-    request.respond(response)?;
     Ok(())
+}
+
+fn dispatch_endpoint(endpoint: &str) -> Option<EndpointResponse> {
+    match endpoint {
+        "hello" => Some(EndpointResponse {
+            status: 200,
+            body: format!("Soy {IDENTITY} y digo hello"),
+        }),
+        "bye" => Some(EndpointResponse {
+            status: 200,
+            body: format!("Soy {IDENTITY} y digo bye"),
+        }),
+        "health" => Some(EndpointResponse {
+            status: 200,
+            body: "ok".into(),
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_endpoint_returns_expected_payloads() {
+        let hello = dispatch_endpoint("hello").expect("hello endpoint");
+        assert_eq!(hello.status, 200);
+        assert!(hello.body.contains("digo hello"));
+
+        let health = dispatch_endpoint("health").expect("health endpoint");
+        assert_eq!(health.status, 200);
+        assert_eq!(health.body, "ok");
+
+        assert!(dispatch_endpoint("unknown").is_none());
+    }
 }
