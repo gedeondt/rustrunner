@@ -22,9 +22,7 @@ pub fn run() -> Result<()> {
     let _service_guards = start_service_processes(&services, &logs)?;
     let health = health::start_health_monitor(&services);
     let schedules = scheduler::start_webhook_schedulers(&services);
-
-    server::run_server(&services, &health, &logs, &schedules)
     let stats = stats::initialize_stats_store();
 
-    server::run_server(&services, &health, &logs, &stats)
+    server::run_server(&services, &health, &logs, &schedules, &stats)
 }

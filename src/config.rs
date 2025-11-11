@@ -108,19 +108,8 @@ pub fn load_services() -> Result<Vec<Service>> {
         let RawServiceConfig {
             prefix,
             url,
-            memory_limit_mb,
             schedules: raw_schedules,
         } = read_service_config(&name)?;
-
-        let memory_limit_bytes =
-            memory_limit_mb
-                .checked_mul(BYTES_PER_MEBIBYTE)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "memory limit for service '{}' exceeds supported range",
-                        name
-                    )
-                })?;
 
         let allowed_get_endpoints = read_service_openapi(&name)?;
         let schedules = normalize_service_schedules(&name, &allowed_get_endpoints, &raw_schedules)?;
