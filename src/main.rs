@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{Cursor, ErrorKind};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::thread;
 use std::time::Duration;
@@ -12,18 +12,17 @@ use tiny_http::{Header, Method, Request, Response, Server};
 use url::Url;
 
 const ENTRY_PORT: u16 = 14000;
-const SERVICE_NAMES: &[&str] = &["hello_world", "bye_world"];
 const SERVICE_STARTUP_ATTEMPTS: usize = 50;
 const SERVICE_STARTUP_BACKOFF_MS: u64 = 100;
 
 struct Service {
-    name: &'static str,
+    name: String,
     prefix: String,
     base_url: String,
 }
 
 struct ServiceGuard {
-    name: &'static str,
+    name: String,
     child: Child,
 }
 
@@ -86,8 +85,51 @@ fn main() -> Result<()> {
 fn load_services() -> Result<Vec<Service>> {
     let mut services = Vec::new();
 
-    for &name in SERVICE_NAMES {
-        let RawServiceConfig { prefix, url } = read_service_config(name)?;
+    let services_dir = Path::new("services");
+
+    if !services_dir.exists() {
+        println!(
+            "Services directory '{}' not found. No services will be loaded.",
+            services_dir.display()
+        );
+        return Ok(services);
+    }
+
+    for entry in fs::read_dir(services_dir).with_context(|| {
+        format!(
+            "failed to read services directory at {}",
+            services_dir.display()
+        )
+    })? {
+        let entry = entry?;
+
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            eprintln!(
+                "Skipping service with non-unicode name in {}",
+                entry.path().display()
+            );
+            continue;
+        };
+
+        let name = name.to_owned();
+
+        let config_path = config_path(&name);
+
+        if !config_path.exists() {
+            println!(
+                "Skipping service '{}' because configuration was not found at {}",
+                name,
+                config_path.display()
+            );
+            continue;
+        }
+
+        let RawServiceConfig { prefix, url } = read_service_config(&name)?;
 
         services.push(Service {
             name,
@@ -95,6 +137,8 @@ fn load_services() -> Result<Vec<Service>> {
             base_url: url,
         });
     }
+
+    services.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(services)
 }
@@ -111,7 +155,7 @@ fn start_service_processes(services: &[Service]) -> Result<Vec<ServiceGuard>> {
             continue;
         }
 
-        let manifest_path = service_manifest_path(service.name);
+        let manifest_path = service_manifest_path(&service.name);
         println!(
             "Starting service '{}' using manifest {}",
             service.name,
@@ -128,7 +172,7 @@ fn start_service_processes(services: &[Service]) -> Result<Vec<ServiceGuard>> {
         match wait_for_service(service) {
             Ok(()) => {
                 guards.push(ServiceGuard {
-                    name: service.name,
+                    name: service.name.clone(),
                     child,
                 });
             }
@@ -239,13 +283,20 @@ fn handle_request(services: &[Service], request: Request) -> Result<()> {
         None => (full_path, None),
     };
 
-    let mut segments = path
-        .trim_start_matches('/')
+    let trimmed_path = path.trim_start_matches('/');
+
+    if trimmed_path.is_empty() {
+        let response = render_homepage(services);
+        request.respond(response)?;
+        return Ok(());
+    }
+
+    let mut segments = trimmed_path
         .split('/')
         .filter(|segment| !segment.is_empty());
 
     let Some(prefix) = segments.next() else {
-        let response = Response::from_string("not found").with_status_code(404);
+        let response = render_homepage(services);
         request.respond(response)?;
         return Ok(());
     };
@@ -312,6 +363,36 @@ fn build_response(upstream: ureq::Response) -> Result<Response<Cursor<Vec<u8>>>>
     }
 
     Ok(response)
+}
+
+fn render_homepage(services: &[Service]) -> Response<Cursor<Vec<u8>>> {
+    let service_section = if services.is_empty() {
+        "<p>No hay servicios cargados actualmente.</p>".to_string()
+    } else {
+        let mut items = String::new();
+        for service in services {
+            items.push_str(&format!(
+                "<li><strong>{}</strong><br/><span>Prefijo: <code>{}</code></span><br/><span>Base URL: <code>{}</code></span></li>",
+                service.name,
+                service.prefix,
+                service.base_url
+            ));
+        }
+
+        format!("<ul class=\"service-list\">{}</ul>", items)
+    };
+
+    let html = format!(
+        "<!DOCTYPE html>\n<html lang=\"es\">\n<head>\n    <meta charset=\"utf-8\" />\n    <title>Servicios disponibles</title>\n    <link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/water.css@2/out/water.css\" />\n</head>\n<body>\n    <main>\n        <h1>Servicios disponibles</h1>\n        <p>Estos son los servicios registrados actualmente en el runner.</p>\n        {}\n    </main>\n</body>\n</html>\n",
+        service_section
+    );
+
+    let mut response = Response::from_string(html);
+    if let Ok(header) = Header::from_bytes(b"Content-Type", b"text/html; charset=utf-8") {
+        response = response.with_header(header);
+    }
+
+    response
 }
 
 fn config_path(name: &str) -> PathBuf {
