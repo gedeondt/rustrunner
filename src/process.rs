@@ -1,10 +1,13 @@
+use std::fs;
 use std::net::ToSocketAddrs;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use toml::Value;
 
 use crate::config::{service_manifest_path, Service};
 use crate::logs::{spawn_log_forwarder, SharedLogMap};
@@ -12,35 +15,93 @@ use crate::logs::{spawn_log_forwarder, SharedLogMap};
 const SERVICE_STARTUP_ATTEMPTS: usize = 50;
 const SERVICE_STARTUP_BACKOFF_MS: u64 = 100;
 
-#[cfg(unix)]
-fn configure_memory_limit(command: &mut Command, limit_bytes: u64) {
-    use std::os::unix::process::CommandExt;
+fn build_service(manifest_path: &Path, service_name: &str) -> Result<()> {
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(manifest_path)
+        .status()
+        .with_context(|| format!("failed to build service '{}' via cargo", service_name))?;
 
-    unsafe {
-        command.pre_exec(move || {
-            set_memory_limit(limit_bytes)?;
-            Ok(())
-        });
-    }
-}
-
-#[cfg(unix)]
-fn set_memory_limit(limit_bytes: u64) -> std::io::Result<()> {
-    let limit = libc::rlimit {
-        rlim_cur: limit_bytes as libc::rlim_t,
-        rlim_max: limit_bytes as libc::rlim_t,
-    };
-
-    let result = unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) };
-    if result == 0 {
+    if status.success() {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error())
+        bail!("cargo build failed for service '{}'", service_name);
     }
 }
 
-#[cfg(not(unix))]
-fn configure_memory_limit(_command: &mut Command, _limit_bytes: u64) {}
+fn service_binary_path(manifest_path: &Path) -> Result<PathBuf> {
+    let service_dir = manifest_path.parent().ok_or_else(|| {
+        anyhow!(
+            "service manifest '{}' does not have a parent directory",
+            manifest_path.display()
+        )
+    })?;
+
+    let package_name = package_name_from_manifest(manifest_path)?;
+
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut relative_path = PathBuf::from("target").join("debug").join(package_name);
+
+    #[cfg(windows)]
+    {
+        relative_path.set_extension("exe");
+    }
+
+    let candidate = service_dir.join(&relative_path);
+
+    if !candidate.exists() {
+        bail!(
+            "compiled binary for manifest '{}' was not found at {}",
+            manifest_path.display(),
+            candidate.display()
+        );
+    }
+
+    let binary_path = candidate.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize binary path for manifest '{}'",
+            manifest_path.display()
+        )
+    })?;
+
+    Ok(binary_path)
+}
+
+fn package_name_from_manifest(manifest_path: &Path) -> Result<String> {
+    let contents = fs::read_to_string(manifest_path).with_context(|| {
+        format!(
+            "failed to read service manifest at {}",
+            manifest_path.display()
+        )
+    })?;
+
+    let document: Value = toml::from_str(&contents).with_context(|| {
+        format!(
+            "failed to parse service manifest at {}",
+            manifest_path.display()
+        )
+    })?;
+
+    let package = document
+        .get("package")
+        .and_then(Value::as_table)
+        .ok_or_else(|| {
+            anyhow!(
+                "service manifest at '{}' is missing the [package] section",
+                manifest_path.display()
+            )
+        })?;
+
+    let name = package.get("name").and_then(Value::as_str).ok_or_else(|| {
+        anyhow!(
+            "service manifest at '{}' is missing package.name",
+            manifest_path.display()
+        )
+    })?;
+
+    Ok(name.to_owned())
+}
 
 pub struct ServiceGuard {
     name: String,
@@ -92,27 +153,41 @@ pub fn start_service_processes(
         }
 
         let manifest_path = service_manifest_path(&service.name);
-        let memory_limit_mib = service.memory_limit_bytes / (1024 * 1024);
         println!(
-            "Starting service '{}' using manifest {} (memory limit: {} MiB)",
+            "Starting service '{}' using manifest {}",
             service.name,
-            manifest_path.display(),
-            memory_limit_mib
+            manifest_path.display()
         );
 
-        let mut command = Command::new("cargo");
+        build_service(&manifest_path, &service.name)?;
+
+        let binary_path = service_binary_path(&manifest_path).with_context(|| {
+            format!(
+                "failed to resolve executable for service '{}'",
+                service.name
+            )
+        })?;
+
+        let service_dir = manifest_path.parent().ok_or_else(|| {
+            anyhow!(
+                "service manifest '{}' does not have a parent directory",
+                manifest_path.display()
+            )
+        })?;
+
+        let mut command = Command::new(&binary_path);
         command
-            .arg("run")
-            .arg("--manifest-path")
-            .arg(&manifest_path)
+            .current_dir(service_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        configure_memory_limit(&mut command, service.memory_limit_bytes);
-
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("failed to start service '{}' via cargo", service.name))?;
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to start service '{}' using binary {}",
+                service.name,
+                binary_path.display()
+            )
+        })?;
 
         if let Some(stdout) = child.stdout.take() {
             spawn_log_forwarder(service.name.clone(), stdout, "stdout", Arc::clone(logs));
@@ -237,7 +312,6 @@ mod tests {
             name: "svc".into(),
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
-            memory_limit_bytes: 64 * 1024 * 1024,
             allowed_get_endpoints: Default::default(),
             schedules: Vec::new(),
         };

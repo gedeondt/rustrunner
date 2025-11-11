@@ -13,7 +13,6 @@ pub struct Service {
     pub name: String,
     pub prefix: String,
     pub base_url: String,
-    pub memory_limit_bytes: u64,
     pub allowed_get_endpoints: HashSet<String>,
     pub schedules: Vec<ServiceSchedule>,
 }
@@ -34,7 +33,6 @@ impl Service {
 struct RawServiceConfig {
     prefix: String,
     url: String,
-    memory_limit_mb: u64,
     #[serde(default)]
     schedules: Vec<RawScheduleConfig>,
 }
@@ -61,8 +59,6 @@ impl<'de> Deserialize<'de> for RawScheduleConfig {
         }
     }
 }
-
-const BYTES_PER_MEBIBYTE: u64 = 1024 * 1024;
 
 pub fn load_services() -> Result<Vec<Service>> {
     let mut services = Vec::new();
@@ -133,7 +129,6 @@ pub fn load_services() -> Result<Vec<Service>> {
             name,
             prefix,
             base_url: url,
-            memory_limit_bytes,
             allowed_get_endpoints,
             schedules,
         });
@@ -188,13 +183,6 @@ fn validate_service_config(name: &str, config: &RawServiceConfig) -> Result<()> 
 
     if config.url.trim().is_empty() {
         bail!("url for service '{}' cannot be empty", name);
-    }
-
-    if config.memory_limit_mb == 0 {
-        bail!(
-            "memory_limit_mb for service '{}' must be greater than zero",
-            name
-        );
     }
 
     Ok(())
@@ -386,7 +374,6 @@ mod tests {
             name: "example".into(),
             prefix: "foo".into(),
             base_url: "http://localhost".into(),
-            memory_limit_bytes: 64 * 1024 * 1024,
             allowed_get_endpoints: ["ping".into()].into_iter().collect(),
             schedules: Vec::new(),
         };

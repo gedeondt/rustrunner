@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use std::io::Cursor;
 use std::time::Instant;
+use std::time::SystemTime;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::config::Service;
@@ -8,6 +9,7 @@ use crate::health::{HealthStatus, SharedHealthMap};
 use crate::logs::SharedLogMap;
 use crate::scheduler::{self, ScheduleState, SharedScheduleMap, ToggleError};
 use serde_json::json;
+use crate::stats::{record_http_status, SharedStats};
 
 const ENTRY_PORT: u16 = 14000;
 
@@ -16,6 +18,7 @@ pub fn run_server(
     health: &SharedHealthMap,
     logs: &SharedLogMap,
     schedules: &SharedScheduleMap,
+    stats: &SharedStats,
 ) -> Result<()> {
     let server = Server::http(("0.0.0.0", ENTRY_PORT)).map_err(|error| {
         anyhow!(
@@ -29,6 +32,7 @@ pub fn run_server(
 
     for request in server.incoming_requests() {
         if let Err(error) = handle_request(services, health, logs, schedules, request) {
+        if let Err(error) = handle_request(services, health, logs, stats, request) {
             eprintln!("Failed to handle request: {:#}", error);
         }
     }
@@ -41,6 +45,7 @@ fn handle_request(
     health: &SharedHealthMap,
     logs: &SharedLogMap,
     schedules: &SharedScheduleMap,
+    stats: &SharedStats,
     request: Request,
 ) -> Result<()> {
     if request.method() != &Method::Get {
@@ -67,6 +72,10 @@ fn handle_request(
         let response = render_homepage(services, health, schedules);
         request.respond(response)?;
         return Ok(());
+    }
+
+    if trimmed_path == "__runner__/stats" {
+        return handle_stats_request(stats, request);
     }
 
     if let Some(rest) = trimmed_path.strip_prefix("__runner__/services/") {
@@ -98,20 +107,47 @@ fn handle_request(
 
     match ureq::request(request.method().as_str(), &target_url).call() {
         Ok(response) => {
+            let status = response.status();
+            record_http_status(stats, &service.name, &endpoint_path, status as u16);
             let response = build_response(response)?;
             request.respond(response)?;
         }
         Err(ureq::Error::Status(_, response)) => {
+            let status = response.status();
+            record_http_status(stats, &service.name, &endpoint_path, status as u16);
             let response = build_response(response)?;
             request.respond(response)?;
         }
         Err(error) => {
             eprintln!("Error contacting service '{}': {}", service.name, error);
+            record_http_status(stats, &service.name, &endpoint_path, 502);
             let response = Response::from_string("upstream error").with_status_code(502);
             request.respond(response)?;
         }
     }
 
+    Ok(())
+}
+
+fn handle_stats_request(stats: &SharedStats, request: Request) -> Result<()> {
+    let snapshot = match stats.lock() {
+        Ok(store) => store.snapshot(SystemTime::now()),
+        Err(_) => {
+            let response = Response::from_string("stats unavailable").with_status_code(503);
+            request.respond(response)?;
+            return Ok(());
+        }
+    };
+
+    let body = serde_json::to_string(&snapshot)
+        .map_err(|error| anyhow!("failed to serialize stats snapshot: {error}"))?;
+
+    let mut response = Response::from_string(body).with_status_code(200);
+    if let Ok(header) = Header::from_bytes(b"Content-Type", b"application/json; charset=utf-8") {
+        response = response.with_header(header);
+    }
+
+    request.respond(response)?;
     Ok(())
 }
 
@@ -497,6 +533,7 @@ fn render_homepage(
             "      .schedule-toggle {{ border: none; background-color: #1a73e8; color: #ffffff; padding: 0.3rem 0.75rem; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }}\n",
             "      .schedule-toggle[data-paused='true'] {{ background-color: #2e7d32; }}\n",
             "      .schedule-toggle:disabled {{ opacity: 0.6; cursor: progress; }}\n",
+            "      .dashboard-actions {{ display: flex; justify-content: flex-end; gap: 0.5rem; margin-bottom: 1rem; }}\n",
             "      .modal {{ position: fixed; inset: 0; background-color: rgba(0, 0, 0, 0.4); display: flex; align-items: center; justify-content: center; padding: 1rem; z-index: 1000; }}\n",
             "      .modal[hidden] {{ display: none; }}\n",
             "      .modal__dialog {{ background: #ffffff; color: #000000; width: min(90vw, 720px); max-height: 80vh; border-radius: 8px; box-shadow: 0 20px 45px rgba(0, 0, 0, 0.2); display: flex; flex-direction: column; overflow: hidden; }}\n",
@@ -505,11 +542,17 @@ fn render_homepage(
             "      .modal__close {{ border: none; background: none; font-size: 1.5rem; line-height: 1; cursor: pointer; }}\n",
             "      .modal__body {{ padding: 1rem; overflow: auto; }}\n",
             "      .modal__body pre {{ margin: 0; font-size: 0.9rem; white-space: pre-wrap; word-break: break-word; }}\n",
+            "      .stats-empty {{ text-align: center; color: #616161; margin: 1rem 0; }}\n",
+            "      .stats-modal__canvas {{ width: 100%; }}\n",
             "    </style>\n",
+            "    <script src=\"https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js\"></script>\n",
             "</head>\n",
             "<body>\n",
             "    <main>\n",
             "      <h1>Servicios disponibles</h1>\n",
+            "      <div class=\"dashboard-actions\">\n",
+            "        <button type=\"button\" id=\"stats-button\" class=\"icon-button\" title=\"Ver estadísticas\" aria-label=\"Ver estadísticas\">📈</button>\n",
+            "      </div>\n",
             "        <p>Estos son los servicios registrados actualmente en el runner.</p>\n",
             "        {service_section}\n",
             "    </main>\n",
@@ -524,6 +567,18 @@ fn render_homepage(
             "        </div>\n",
             "      </div>\n",
             "    </div>\n",
+            "    <div id=\"stats-modal\" class=\"modal\" hidden>\n",
+            "      <div class=\"modal__dialog\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"stats-modal-title\">\n",
+            "        <div class=\"modal__header\">\n",
+            "          <h2 id=\"stats-modal-title\" class=\"modal__title\">Estadísticas de respuestas</h2>\n",
+            "          <button type=\"button\" class=\"modal__close\" aria-label=\"Cerrar\">✖</button>\n",
+            "        </div>\n",
+            "        <div class=\"modal__body\">\n",
+            "          <p id=\"stats-empty\" class=\"stats-empty\" hidden>Sin datos disponibles todavía.</p>\n",
+            "          <canvas id=\"stats-chart\" class=\"stats-modal__canvas\" width=\"600\" height=\"320\" hidden></canvas>\n",
+            "        </div>\n",
+            "      </div>\n",
+            "    </div>\n",
             "    <script>\n",
             "      (function() {{\n",
             "        const modal = document.getElementById('modal');\n",
@@ -531,18 +586,18 @@ fn render_homepage(
             "        const contentEl = document.getElementById('modal-content');\n",
             "        const closeBtn = modal.querySelector('.modal__close');\n",
             "        const ACTION_LABELS = {{ logs: 'Logs', openapi: 'OpenAPI' }};\n",
-            "\n",
+
             "        function closeModal() {{\n",
             "          modal.setAttribute('hidden', 'hidden');\n",
             "          contentEl.textContent = '';\n",
             "        }}\n",
-            "\n",
+
             "        async function openModal(action, service) {{\n",
             "          const label = ACTION_LABELS[action] || 'Detalles';\n",
             "          titleEl.textContent = label + ' — ' + service;\n",
             "          contentEl.textContent = 'Cargando...';\n",
             "          modal.removeAttribute('hidden');\n",
-            "\n",
+
             "          try {{\n",
             "            const response = await fetch('/__runner__/services/' + encodeURIComponent(service) + '/' + action);\n",
             "            if (!response.ok) {{\n",
@@ -563,8 +618,8 @@ fn render_homepage(
             "            contentEl.textContent = 'Error al cargar: ' + error.message;\n",
             "          }}\n",
             "        }}\n",
-            "\n",
-            "        document.querySelectorAll('.icon-button').forEach((button) => {{\n",
+
+            "        document.querySelectorAll('.icon-button[data-action][data-service]').forEach((button) => {{\n",
             "          button.addEventListener('click', () => {{\n",
             "            const action = button.getAttribute('data-action');\n",
             "            const service = button.getAttribute('data-service');\n",
@@ -621,6 +676,7 @@ fn render_homepage(
             "          }});\n",
             "        }});\n",
             "\n",
+
             "        closeBtn.addEventListener('click', closeModal);\n",
             "        modal.addEventListener('click', (event) => {{\n",
             "          if (event.target === modal) {{\n",
@@ -630,6 +686,108 @@ fn render_homepage(
             "        document.addEventListener('keydown', (event) => {{\n",
             "          if (event.key === 'Escape' && !modal.hasAttribute('hidden')) {{\n",
             "            closeModal();\n",
+            "          }}\n",
+            "        }});\n",
+            "      }})();\n",
+            "      (function() {{\n",
+            "        const statsButton = document.getElementById('stats-button');\n",
+            "        const statsModal = document.getElementById('stats-modal');\n",
+            "        if (!statsButton || !statsModal) {{\n",
+            "          return;\n",
+            "        }}\n",
+            "        const closeBtn = statsModal.querySelector('.modal__close');\n",
+            "        const emptyState = document.getElementById('stats-empty');\n",
+            "        const chartCanvas = document.getElementById('stats-chart');\n",
+            "        let chartInstance = null;\n",
+
+            "        function closeStatsModal() {{\n",
+            "          statsModal.setAttribute('hidden', 'hidden');\n",
+            "        }}\n",
+
+            "        function showMessage(message) {{\n",
+            "          emptyState.textContent = message;\n",
+            "          emptyState.removeAttribute('hidden');\n",
+            "          chartCanvas.setAttribute('hidden', 'hidden');\n",
+            "        }}\n",
+
+            "        function renderChart(labels, datasets) {{\n",
+            "          emptyState.setAttribute('hidden', 'hidden');\n",
+            "          chartCanvas.removeAttribute('hidden');\n",
+            "          if (chartInstance) {{\n",
+            "            chartInstance.destroy();\n",
+            "          }}\n",
+            "          chartInstance = new Chart(chartCanvas, {{\n",
+            "            type: 'line',\n",
+            "            data: {{ labels, datasets }},\n",
+            "            options: {{\n",
+            "              responsive: true,\n",
+            "              maintainAspectRatio: false,\n",
+            "              scales: {{\n",
+            "                y: {{ beginAtZero: true, ticks: {{ precision: 0 }} }}\n",
+            "              }}\n",
+            "            }}\n",
+            "          }});\n",
+            "        }}\n",
+
+            "        async function openStatsModal() {{\n",
+            "          statsModal.removeAttribute('hidden');\n",
+            "          showMessage('Cargando estadísticas...');\n",
+            "          try {{\n",
+            "            const response = await fetch('/__runner__/stats');\n",
+            "            if (!response.ok) {{\n",
+            "              const text = await response.text();\n",
+            "              throw new Error(text || ('Error ' + response.status));\n",
+            "            }}\n",
+            "            const payload = await response.json();\n",
+            "            const minutes = Array.isArray(payload.global) ? payload.global : [];\n",
+            "            if (!minutes.length) {{\n",
+            "              showMessage('Sin datos disponibles todavía.');\n",
+            "              return;\n",
+            "            }}\n",
+            "            const codes = new Set();\n",
+            "            minutes.forEach((entry) => {{\n",
+            "              if (entry && entry.counts) {{\n",
+            "                Object.keys(entry.counts).forEach((code) => codes.add(code));\n",
+            "              }}\n",
+            "            }});\n",
+            "            const sortedCodes = Array.from(codes).sort();\n",
+            "            const labels = minutes.map((entry) => {{\n",
+            "              const minute = Number(entry.minute || 0);\n",
+            "              const date = new Date(minute * 60000);\n",
+            "              return date.toISOString().substring(11, 16);\n",
+            "            }});\n",
+            "            const palette = ['#1976d2', '#388e3c', '#f57c00', '#c2185b', '#7b1fa2', '#0097a7', '#455a64'];\n",
+            "            const datasets = sortedCodes.map((code, index) => {{\n",
+            "              const color = palette[index % palette.length];\n",
+            "              return {{\n",
+            "                label: 'HTTP ' + code,\n",
+            "                data: minutes.map((entry) => {{\n",
+            "                  const counts = entry && entry.counts ? entry.counts : {{}};\n",
+            "                  const value = counts[code];\n",
+            "                  return typeof value === 'number' ? value : Number(value || 0);\n",
+            "                }}),\n",
+            "                borderColor: color,\n",
+            "                backgroundColor: color,\n",
+            "                tension: 0.25,\n",
+            "                fill: false,\n",
+            "              }};\n",
+            "            }});\n",
+            "            renderChart(labels, datasets);\n",
+            "          }} catch (error) {{\n",
+            "            showMessage('Error al cargar estadísticas: ' + error.message);\n",
+            "          }}\n",
+            "        }}\n",
+
+            "        statsButton.addEventListener('click', openStatsModal);\n",
+            "        closeBtn.addEventListener('click', closeStatsModal);\n",
+            "        statsModal.addEventListener('click', (event) => {{\n",
+            "          if (event.target === statsModal) {{\n",
+            "            closeStatsModal();\n",
+            "          }}\n",
+            "        }});\n",
+            "        document.addEventListener('keydown', (event) => {{\n",
+            "          if (event.key === 'Escape' && !statsModal.hasAttribute('hidden')) {{\n",
+            "            closeStatsModal();\n",
             "          }}\n",
             "        }});\n",
             "      }})();\n",
@@ -658,7 +816,6 @@ mod tests {
             name: "svc".into(),
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
-            memory_limit_bytes: 64 * 1024 * 1024,
             allowed_get_endpoints: Default::default(),
             schedules: Vec::new(),
         };
@@ -677,7 +834,6 @@ mod tests {
             name: "svc".into(),
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
-            memory_limit_bytes: 64 * 1024 * 1024,
             allowed_get_endpoints: Default::default(),
             schedules: Vec::new(),
         };
