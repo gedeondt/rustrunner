@@ -43,9 +43,11 @@ fn handle_request(request: Request) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let message = match endpoint {
-        "hello" => format!("Soy {IDENTITY} y digo hello"),
-        "bye" => format!("Soy {IDENTITY} y digo bye"),
+    let response = match endpoint {
+        "hello" => Response::from_string(format!("Soy {IDENTITY} y digo hello"))
+            .with_status_code(200),
+        "bye" => Response::from_string(format!("Soy {IDENTITY} y digo bye")).with_status_code(200),
+        "health" => Response::from_string("ok").with_status_code(200),
         _ => {
             let response = Response::from_string("not found").with_status_code(404);
             request.respond(response)?;
@@ -53,7 +55,6 @@ fn handle_request(request: Request) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let response = Response::from_string(message).with_status_code(200);
     request.respond(response)?;
     Ok(())
 }

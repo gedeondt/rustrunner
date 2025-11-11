@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Cursor, ErrorKind};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -14,12 +16,31 @@ use url::Url;
 const ENTRY_PORT: u16 = 14000;
 const SERVICE_STARTUP_ATTEMPTS: usize = 50;
 const SERVICE_STARTUP_BACKOFF_MS: u64 = 100;
+const HEALTH_POLL_INTERVAL_SECS: u64 = 5;
+const HEALTH_REQUEST_TIMEOUT_SECS: u64 = 2;
 
+#[derive(Clone)]
 struct Service {
     name: String,
     prefix: String,
     base_url: String,
 }
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum HealthStatus {
+    #[default]
+    Unknown,
+    Healthy,
+    Unhealthy,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ServiceHealth {
+    status: HealthStatus,
+    last_checked: Option<Instant>,
+}
+
+type SharedHealthMap = Arc<Mutex<HashMap<String, ServiceHealth>>>;
 
 struct ServiceGuard {
     name: String,
@@ -62,6 +83,7 @@ struct RawServiceConfig {
 fn main() -> Result<()> {
     let services = load_services()?;
     let _service_guards = start_service_processes(&services)?;
+    let health = start_health_monitor(&services);
 
     let server = Server::http(("0.0.0.0", ENTRY_PORT)).map_err(|error| {
         anyhow!(
@@ -74,7 +96,7 @@ fn main() -> Result<()> {
     println!("Runner listening on http://{}:{}", "0.0.0.0", ENTRY_PORT);
 
     for request in server.incoming_requests() {
-        if let Err(error) = handle_request(&services, request) {
+        if let Err(error) = handle_request(&services, &health, request) {
             eprintln!("Failed to handle request: {:#}", error);
         }
     }
@@ -270,7 +292,7 @@ fn probe_service(service: &Service) -> Result<()> {
     )
 }
 
-fn handle_request(services: &[Service], request: Request) -> Result<()> {
+fn handle_request(services: &[Service], health: &SharedHealthMap, request: Request) -> Result<()> {
     if request.method() != &Method::Get {
         let response = Response::from_string("method not allowed").with_status_code(405);
         request.respond(response)?;
@@ -285,8 +307,14 @@ fn handle_request(services: &[Service], request: Request) -> Result<()> {
 
     let trimmed_path = path.trim_start_matches('/');
 
+    if trimmed_path == "health" {
+        let response = Response::from_string("ok").with_status_code(200);
+        request.respond(response)?;
+        return Ok(());
+    }
+
     if trimmed_path.is_empty() {
-        let response = render_homepage(services);
+        let response = render_homepage(services, health);
         request.respond(response)?;
         return Ok(());
     }
@@ -296,7 +324,7 @@ fn handle_request(services: &[Service], request: Request) -> Result<()> {
         .filter(|segment| !segment.is_empty());
 
     let Some(prefix) = segments.next() else {
-        let response = render_homepage(services);
+        let response = render_homepage(services, health);
         request.respond(response)?;
         return Ok(());
     };
@@ -365,17 +393,41 @@ fn build_response(upstream: ureq::Response) -> Result<Response<Cursor<Vec<u8>>>>
     Ok(response)
 }
 
-fn render_homepage(services: &[Service]) -> Response<Cursor<Vec<u8>>> {
+fn render_homepage(services: &[Service], health: &SharedHealthMap) -> Response<Cursor<Vec<u8>>> {
     let service_section = if services.is_empty() {
         "<p>No hay servicios cargados actualmente.</p>".to_string()
     } else {
         let mut items = String::new();
+        let health_snapshot = health.lock().map(|map| map.clone()).unwrap_or_default();
         for service in services {
+            let health_info = health_snapshot
+                .get(&service.name)
+                .copied()
+                .unwrap_or_default();
+            let (status_label, status_class) = match health_info.status {
+                HealthStatus::Healthy => ("🟢 En línea", "status status--healthy"),
+                HealthStatus::Unhealthy => ("🔴 Fuera de servicio", "status status--unhealthy"),
+                HealthStatus::Unknown => ("⚪️ Sin datos", "status status--unknown"),
+            };
+            let last_checked = match health_info.last_checked {
+                Some(instant) => {
+                    let seconds = instant.elapsed().as_secs();
+                    match seconds {
+                        0 => "Última verificación hace menos de un segundo".to_string(),
+                        1 => "Última verificación hace 1 segundo".to_string(),
+                        _ => format!("Última verificación hace {} segundos", seconds),
+                    }
+                }
+                None => "Última verificación pendiente".to_string(),
+            };
             items.push_str(&format!(
-                "<li><strong>{}</strong><br/><span>Prefijo: <code>{}</code></span><br/><span>Base URL: <code>{}</code></span></li>",
+                "<li><strong>{}</strong><br/><span class=\"{}\">{}</span><br/><span>Prefijo: <code>{}</code></span><br/><span>Base URL: <code>{}</code></span><br/><small>{}</small></li>",
                 service.name,
+                status_class,
+                status_label,
                 service.prefix,
-                service.base_url
+                service.base_url,
+                last_checked
             ));
         }
 
@@ -383,7 +435,7 @@ fn render_homepage(services: &[Service]) -> Response<Cursor<Vec<u8>>> {
     };
 
     let html = format!(
-        "<!DOCTYPE html>\n<html lang=\"es\">\n<head>\n    <meta charset=\"utf-8\" />\n    <title>Servicios disponibles</title>\n    <link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/water.css@2/out/water.css\" />\n</head>\n<body>\n    <main>\n        <h1>Servicios disponibles</h1>\n        <p>Estos son los servicios registrados actualmente en el runner.</p>\n        {}\n    </main>\n</body>\n</html>\n",
+        "<!DOCTYPE html>\n<html lang=\"es\">\n<head>\n    <meta charset=\"utf-8\" />\n    <title>Servicios disponibles</title>\n    <link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/water.css@2/out/water.css\" />\n    <style>\n      .service-list {{ list-style: none; padding: 0; }}\n      .service-list li {{ margin-bottom: 1.5rem; }}\n      .status {{ font-weight: bold; display: inline-block; margin-bottom: 0.25rem; }}\n      .status--healthy {{ color: #0a7d24; }}\n      .status--unhealthy {{ color: #c62828; }}\n      .status--unknown {{ color: #616161; }}\n    </style>\n</head>\n<body>\n    <main>\n      <h1>Servicios disponibles</h1>\n        <p>Estos son los servicios registrados actualmente en el runner.</p>\n        {}\n    </main>\n</body>\n</html>\n",
         service_section
     );
 
@@ -393,6 +445,61 @@ fn render_homepage(services: &[Service]) -> Response<Cursor<Vec<u8>>> {
     }
 
     response
+}
+
+fn start_health_monitor(services: &[Service]) -> SharedHealthMap {
+    let health_map: SharedHealthMap = Arc::new(Mutex::new(HashMap::new()));
+
+    if let Ok(mut guard) = health_map.lock() {
+        for service in services {
+            guard.insert(service.name.clone(), ServiceHealth::default());
+        }
+    }
+
+    if services.is_empty() {
+        return health_map;
+    }
+
+    let services_for_monitor = services.to_vec();
+    let health_clone = Arc::clone(&health_map);
+
+    thread::spawn(move || loop {
+        for service in &services_for_monitor {
+            let url = format!("{}/health", service.base_url.trim_end_matches('/'));
+            let now = Instant::now();
+            let status = match ureq::get(&url)
+                .timeout(Duration::from_secs(HEALTH_REQUEST_TIMEOUT_SECS))
+                .call()
+            {
+                Ok(response) if response.status() == 200 => HealthStatus::Healthy,
+                Ok(response) => {
+                    eprintln!(
+                        "Servicio '{}' respondió {} en su healthcheck",
+                        service.name,
+                        response.status()
+                    );
+                    HealthStatus::Unhealthy
+                }
+                Err(error) => {
+                    eprintln!(
+                        "No se pudo contactar al servicio '{}' en {}: {}",
+                        service.name, url, error
+                    );
+                    HealthStatus::Unhealthy
+                }
+            };
+
+            if let Ok(mut map) = health_clone.lock() {
+                let entry = map.entry(service.name.clone()).or_default();
+                entry.status = status;
+                entry.last_checked = Some(now);
+            }
+        }
+
+        thread::sleep(Duration::from_secs(HEALTH_POLL_INTERVAL_SECS));
+    });
+
+    health_map
 }
 
 fn config_path(name: &str) -> PathBuf {
