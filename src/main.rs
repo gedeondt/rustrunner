@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Cursor, ErrorKind};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -19,6 +19,7 @@ const SERVICE_STARTUP_ATTEMPTS: usize = 50;
 const SERVICE_STARTUP_BACKOFF_MS: u64 = 100;
 const HEALTH_POLL_INTERVAL_SECS: u64 = 5;
 const HEALTH_REQUEST_TIMEOUT_SECS: u64 = 2;
+const MAX_STORED_LOG_LINES: usize = 200;
 
 #[derive(Clone)]
 struct Service {
@@ -49,6 +50,7 @@ struct ServiceHealth {
 }
 
 type SharedHealthMap = Arc<Mutex<HashMap<String, ServiceHealth>>>;
+type SharedLogMap = Arc<Mutex<HashMap<String, VecDeque<String>>>>;
 
 struct ServiceGuard {
     name: String,
@@ -90,7 +92,8 @@ struct RawServiceConfig {
 
 fn main() -> Result<()> {
     let services = load_services()?;
-    let _service_guards = start_service_processes(&services)?;
+    let logs = initialize_log_store(&services);
+    let _service_guards = start_service_processes(&services, &logs)?;
     let health = start_health_monitor(&services);
 
     let server = Server::http(("0.0.0.0", ENTRY_PORT)).map_err(|error| {
@@ -104,7 +107,7 @@ fn main() -> Result<()> {
     println!("Runner listening on http://{}:{}", "0.0.0.0", ENTRY_PORT);
 
     for request in server.incoming_requests() {
-        if let Err(error) = handle_request(&services, &health, request) {
+        if let Err(error) = handle_request(&services, &health, &logs, request) {
             eprintln!("Failed to handle request: {:#}", error);
         }
     }
@@ -175,7 +178,19 @@ fn load_services() -> Result<Vec<Service>> {
     Ok(services)
 }
 
-fn start_service_processes(services: &[Service]) -> Result<Vec<ServiceGuard>> {
+fn initialize_log_store(services: &[Service]) -> SharedLogMap {
+    let store: SharedLogMap = Arc::new(Mutex::new(HashMap::new()));
+
+    if let Ok(mut guard) = store.lock() {
+        for service in services {
+            guard.insert(service.name.clone(), VecDeque::new());
+        }
+    }
+
+    store
+}
+
+fn start_service_processes(services: &[Service], logs: &SharedLogMap) -> Result<Vec<ServiceGuard>> {
     let mut guards = Vec::new();
 
     for service in services {
@@ -204,11 +219,11 @@ fn start_service_processes(services: &[Service]) -> Result<Vec<ServiceGuard>> {
             .with_context(|| format!("failed to start service '{}' via cargo", service.name))?;
 
         if let Some(stdout) = child.stdout.take() {
-            spawn_log_forwarder(service.name.clone(), stdout, "stdout");
+            spawn_log_forwarder(service.name.clone(), stdout, "stdout", Arc::clone(logs));
         }
 
         if let Some(stderr) = child.stderr.take() {
-            spawn_log_forwarder(service.name.clone(), stderr, "stderr");
+            spawn_log_forwarder(service.name.clone(), stderr, "stderr", Arc::clone(logs));
         }
 
         match wait_for_service(service) {
@@ -236,8 +251,12 @@ fn start_service_processes(services: &[Service]) -> Result<Vec<ServiceGuard>> {
     Ok(guards)
 }
 
-fn spawn_log_forwarder<R>(service_name: String, reader: R, stream_label: &'static str)
-where
+fn spawn_log_forwarder<R>(
+    service_name: String,
+    reader: R,
+    stream_label: &'static str,
+    logs: SharedLogMap,
+) where
     R: std::io::Read + Send + 'static,
 {
     thread::spawn(move || {
@@ -248,7 +267,15 @@ where
                     let (level, message) = parse_service_log_line(&line)
                         .map(|(level, message)| (level.to_string(), message.to_string()))
                         .unwrap_or_else(|| (stream_label.to_uppercase(), line));
-                    println!("[svc:{}][{}] {}", service_name, level, message);
+                    let formatted = format!("[svc:{}][{}] {}", service_name, level, message);
+                    println!("{}", formatted);
+                    if let Ok(mut guard) = logs.lock() {
+                        let entry = guard.entry(service_name.clone()).or_default();
+                        entry.push_back(formatted);
+                        while entry.len() > MAX_STORED_LOG_LINES {
+                            entry.pop_front();
+                        }
+                    }
                 }
                 Err(error) => {
                     eprintln!(
@@ -346,7 +373,12 @@ fn probe_service(service: &Service) -> Result<()> {
     )
 }
 
-fn handle_request(services: &[Service], health: &SharedHealthMap, request: Request) -> Result<()> {
+fn handle_request(
+    services: &[Service],
+    health: &SharedHealthMap,
+    logs: &SharedLogMap,
+    request: Request,
+) -> Result<()> {
     if request.method() != &Method::Get {
         let response = Response::from_string("method not allowed").with_status_code(405);
         request.respond(response)?;
@@ -371,6 +403,91 @@ fn handle_request(services: &[Service], health: &SharedHealthMap, request: Reque
         let response = render_homepage(services, health);
         request.respond(response)?;
         return Ok(());
+    }
+
+    if let Some(rest) = trimmed_path.strip_prefix("__runner__/services/") {
+        let mut segments = rest.split('/').filter(|segment| !segment.is_empty());
+        let Some(service_name) = segments.next() else {
+            let response = Response::from_string("not found").with_status_code(404);
+            request.respond(response)?;
+            return Ok(());
+        };
+
+        let Some(action) = segments.next() else {
+            let response = Response::from_string("not found").with_status_code(404);
+            request.respond(response)?;
+            return Ok(());
+        };
+
+        if !services.iter().any(|service| service.name == service_name) {
+            let response = Response::from_string("not found").with_status_code(404);
+            request.respond(response)?;
+            return Ok(());
+        }
+
+        match action {
+            "logs" => {
+                let body = match logs.lock() {
+                    Ok(store) => match store.get(service_name) {
+                        Some(lines) if !lines.is_empty() => {
+                            lines.iter().cloned().collect::<Vec<_>>().join("\n")
+                        }
+                        Some(_) => "No hay logs disponibles aún.".to_string(),
+                        None => {
+                            let response = Response::from_string("not found").with_status_code(404);
+                            request.respond(response)?;
+                            return Ok(());
+                        }
+                    },
+                    Err(_) => {
+                        let response =
+                            Response::from_string("log store unavailable").with_status_code(500);
+                        request.respond(response)?;
+                        return Ok(());
+                    }
+                };
+
+                let mut response = Response::from_string(body);
+                if let Ok(header) =
+                    Header::from_bytes(b"Content-Type", b"text/plain; charset=utf-8")
+                {
+                    response = response.with_header(header);
+                }
+
+                request.respond(response)?;
+                return Ok(());
+            }
+            "openapi" => {
+                let path = openapi_path(service_name);
+                match fs::read_to_string(&path) {
+                    Ok(contents) => {
+                        let mut response = Response::from_string(contents);
+                        if let Ok(header) =
+                            Header::from_bytes(b"Content-Type", b"application/json; charset=utf-8")
+                        {
+                            response = response.with_header(header);
+                        }
+                        request.respond(response)?;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "failed to read OpenAPI specification for service '{}': {}",
+                            service_name, error
+                        );
+                        let response =
+                            Response::from_string("openapi not available").with_status_code(500);
+                        request.respond(response)?;
+                        return Ok(());
+                    }
+                }
+            }
+            _ => {
+                let response = Response::from_string("not found").with_status_code(404);
+                request.respond(response)?;
+                return Ok(());
+            }
+        }
     }
 
     let mut segments = trimmed_path
@@ -482,23 +599,150 @@ fn render_homepage(services: &[Service], health: &SharedHealthMap) -> Response<C
                 }
                 None => "Última verificación pendiente".to_string(),
             };
-            items.push_str(&format!(
-                "<li><strong>{}</strong><br/><span class=\"{}\">{}</span><br/><span>Prefijo: <code>{}</code></span><br/><span>Base URL: <code>{}</code></span><br/><small>{}</small></li>",
-                service.name,
-                status_class,
-                status_label,
-                service.prefix,
-                service.base_url,
-                last_checked
-            ));
+
+            let item = format!(
+                concat!(
+                    "<li>",
+                    "  <div class=\"service-header\">",
+                    "    <strong>{name}</strong>",
+                    "    <span class=\"service-actions\">",
+                    "      <button type=\"button\" class=\"icon-button\" data-action=\"logs\" data-service=\"{name}\" title=\"Ver logs\" aria-label=\"Ver logs de {name}\">📜</button>",
+                    "      <button type=\"button\" class=\"icon-button\" data-action=\"openapi\" data-service=\"{name}\" title=\"Ver OpenAPI\" aria-label=\"Ver OpenAPI de {name}\">📘</button>",
+                    "    </span>",
+                    "  </div>",
+                    "  <span class=\"{status_class}\">{status_label}</span><br/>",
+                    "  <span>Prefijo: <code>{prefix}</code></span><br/>",
+                    "  <span>Base URL: <code>{base_url}</code></span><br/>",
+                    "  <small>{last_checked}</small>",
+                    "</li>"
+                ),
+                name = service.name,
+                status_class = status_class,
+                status_label = status_label,
+                prefix = service.prefix,
+                base_url = service.base_url,
+                last_checked = last_checked
+            );
+
+            items.push_str(&item);
         }
 
         format!("<ul class=\"service-list\">{}</ul>", items)
     };
 
     let html = format!(
-        "<!DOCTYPE html>\n<html lang=\"es\">\n<head>\n    <meta charset=\"utf-8\" />\n    <title>Servicios disponibles</title>\n    <link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/water.css@2/out/water.css\" />\n    <style>\n      .service-list {{ list-style: none; padding: 0; }}\n      .service-list li {{ margin-bottom: 1.5rem; }}\n      .status {{ font-weight: bold; display: inline-block; margin-bottom: 0.25rem; }}\n      .status--healthy {{ color: #0a7d24; }}\n      .status--unhealthy {{ color: #c62828; }}\n      .status--unknown {{ color: #616161; }}\n    </style>\n</head>\n<body>\n    <main>\n      <h1>Servicios disponibles</h1>\n        <p>Estos son los servicios registrados actualmente en el runner.</p>\n        {}\n    </main>\n</body>\n</html>\n",
-        service_section
+        concat!(
+            "<!DOCTYPE html>\n",
+            "<html lang=\"es\">\n",
+            "<head>\n",
+            "    <meta charset=\"utf-8\" />\n",
+            "    <title>Servicios disponibles</title>\n",
+            "    <link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/water.css@2/out/water.css\" />\n",
+            "    <style>\n",
+            "      .service-list {{ list-style: none; padding: 0; }}\n",
+            "      .service-list li {{ margin-bottom: 1.5rem; }}\n",
+            "      .service-header {{ display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }}\n",
+            "      .service-actions {{ display: inline-flex; align-items: center; gap: 0.25rem; }}\n",
+            "      .icon-button {{ border: none; background: none; cursor: pointer; font-size: 1.25rem; line-height: 1; padding: 0.1rem; }}\n",
+            "      .icon-button:focus {{ outline: 2px solid #4a90e2; outline-offset: 2px; }}\n",
+            "      .status {{ font-weight: bold; display: inline-block; margin-bottom: 0.25rem; }}\n",
+            "      .status--healthy {{ color: #0a7d24; }}\n",
+            "      .status--unhealthy {{ color: #c62828; }}\n",
+            "      .status--unknown {{ color: #616161; }}\n",
+            "      .modal {{ position: fixed; inset: 0; background-color: rgba(0, 0, 0, 0.4); display: flex; align-items: center; justify-content: center; padding: 1rem; z-index: 1000; }}\n",
+            "      .modal[hidden] {{ display: none; }}\n",
+            "      .modal__dialog {{ background: #ffffff; color: #000000; width: min(90vw, 720px); max-height: 80vh; border-radius: 8px; box-shadow: 0 20px 45px rgba(0, 0, 0, 0.2); display: flex; flex-direction: column; overflow: hidden; }}\n",
+            "      .modal__header {{ display: flex; align-items: center; justify-content: space-between; padding: 0.75rem 1rem; border-bottom: 1px solid #e0e0e0; }}\n",
+            "      .modal__title {{ margin: 0; font-size: 1.1rem; }}\n",
+            "      .modal__close {{ border: none; background: none; font-size: 1.5rem; line-height: 1; cursor: pointer; }}\n",
+            "      .modal__body {{ padding: 1rem; overflow: auto; }}\n",
+            "      .modal__body pre {{ margin: 0; font-size: 0.9rem; white-space: pre-wrap; word-break: break-word; }}\n",
+            "    </style>\n",
+            "</head>\n",
+            "<body>\n",
+            "    <main>\n",
+            "      <h1>Servicios disponibles</h1>\n",
+            "        <p>Estos son los servicios registrados actualmente en el runner.</p>\n",
+            "        {service_section}\n",
+            "    </main>\n",
+            "    <div id=\"modal\" class=\"modal\" hidden>\n",
+            "      <div class=\"modal__dialog\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"modal-title\">\n",
+            "        <div class=\"modal__header\">\n",
+            "          <h2 id=\"modal-title\" class=\"modal__title\"></h2>\n",
+            "          <button type=\"button\" class=\"modal__close\" aria-label=\"Cerrar\">✖</button>\n",
+            "        </div>\n",
+            "        <div class=\"modal__body\">\n",
+            "          <pre id=\"modal-content\"></pre>\n",
+            "        </div>\n",
+            "      </div>\n",
+            "    </div>\n",
+            "    <script>\n",
+            "      (function() {{\n",
+            "        const modal = document.getElementById('modal');\n",
+            "        const titleEl = document.getElementById('modal-title');\n",
+            "        const contentEl = document.getElementById('modal-content');\n",
+            "        const closeBtn = modal.querySelector('.modal__close');\n",
+            "        const ACTION_LABELS = {{ logs: 'Logs', openapi: 'OpenAPI' }};\n",
+            "\n",
+            "        function closeModal() {{\n",
+            "          modal.setAttribute('hidden', 'hidden');\n",
+            "          contentEl.textContent = '';\n",
+            "        }}\n",
+            "\n",
+            "        async function openModal(action, service) {{\n",
+            "          const label = ACTION_LABELS[action] || 'Detalles';\n",
+            "          titleEl.textContent = label + ' — ' + service;\n",
+            "          contentEl.textContent = 'Cargando...';\n",
+            "          modal.removeAttribute('hidden');\n",
+            "\n",
+            "          try {{\n",
+            "            const response = await fetch('/__runner__/services/' + encodeURIComponent(service) + '/' + action);\n",
+            "            if (!response.ok) {{\n",
+            "              const text = await response.text();\n",
+            "              throw new Error(text || ('Error ' + response.status));\n",
+            "            }}\n",
+            "            let text = await response.text();\n",
+            "            if (action === 'openapi' && text) {{\n",
+            "              try {{\n",
+            "                const parsed = JSON.parse(text);\n",
+            "                text = JSON.stringify(parsed, null, 2);\n",
+            "              }} catch (_) {{\n",
+            "                // dejar el texto tal cual\n",
+            "              }}\n",
+            "            }}\n",
+            "            contentEl.textContent = text || 'Sin contenido disponible.';\n",
+            "          }} catch (error) {{\n",
+            "            contentEl.textContent = 'Error al cargar: ' + error.message;\n",
+            "          }}\n",
+            "        }}\n",
+            "\n",
+            "        document.querySelectorAll('.icon-button').forEach((button) => {{\n",
+            "          button.addEventListener('click', () => {{\n",
+            "            const action = button.getAttribute('data-action');\n",
+            "            const service = button.getAttribute('data-service');\n",
+            "            if (action && service) {{\n",
+            "              openModal(action, service);\n",
+            "            }}\n",
+            "          }});\n",
+            "        }});\n",
+            "\n",
+            "        closeBtn.addEventListener('click', closeModal);\n",
+            "        modal.addEventListener('click', (event) => {{\n",
+            "          if (event.target === modal) {{\n",
+            "            closeModal();\n",
+            "          }}\n",
+            "        }});\n",
+            "        document.addEventListener('keydown', (event) => {{\n",
+            "          if (event.key === 'Escape' && !modal.hasAttribute('hidden')) {{\n",
+            "            closeModal();\n",
+            "          }}\n",
+            "        }});\n",
+            "      }})();\n",
+            "    </script>\n",
+            "</body>\n",
+            "</html>\n"
+        ),
+        service_section = service_section
     );
 
     let mut response = Response::from_string(html);
