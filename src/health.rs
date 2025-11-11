@@ -98,6 +98,7 @@ mod tests {
             prefix: "svc".into(),
             base_url: "http://localhost:1234/".into(),
             allowed_get_endpoints: Default::default(),
+            schedules: Vec::new(),
         };
 
         assert_eq!(healthcheck_url(&service), "http://localhost:1234/health");
@@ -110,6 +111,7 @@ mod tests {
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
             allowed_get_endpoints: Default::default(),
+            schedules: Vec::new(),
         };
 
         let health = start_health_monitor(&[service.clone()]);

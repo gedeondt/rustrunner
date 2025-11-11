@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::de::{self, Deserializer};
 use serde::Deserialize;
 use serde_json::Value;
 use tiny_http::Method;
@@ -13,6 +14,13 @@ pub struct Service {
     pub prefix: String,
     pub base_url: String,
     pub allowed_get_endpoints: HashSet<String>,
+    pub schedules: Vec<ServiceSchedule>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceSchedule {
+    pub endpoint: String,
+    pub interval_secs: u64,
 }
 
 impl Service {
@@ -25,6 +33,31 @@ impl Service {
 struct RawServiceConfig {
     prefix: String,
     url: String,
+    #[serde(default)]
+    schedules: Vec<RawScheduleConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct RawScheduleConfig {
+    endpoint: String,
+    interval_secs: u64,
+}
+
+impl<'de> Deserialize<'de> for RawScheduleConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+
+        match value {
+            Value::Array(items) => parse_schedule_from_array(items).map_err(de::Error::custom),
+            Value::Object(map) => parse_schedule_from_object(map).map_err(de::Error::custom),
+            other => Err(de::Error::custom(format!(
+                "schedule entry must be an array or object, found {other:?}"
+            ))),
+        }
+    }
 }
 
 pub fn load_services() -> Result<Vec<Service>> {
@@ -72,15 +105,32 @@ pub fn load_services() -> Result<Vec<Service>> {
             continue;
         }
 
-        let RawServiceConfig { prefix, url } = read_service_config(&name)?;
+        let RawServiceConfig {
+            prefix,
+            url,
+            memory_limit_mb,
+            schedules: raw_schedules,
+        } = read_service_config(&name)?;
+
+        let memory_limit_bytes =
+            memory_limit_mb
+                .checked_mul(BYTES_PER_MEBIBYTE)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "memory limit for service '{}' exceeds supported range",
+                        name
+                    )
+                })?;
 
         let allowed_get_endpoints = read_service_openapi(&name)?;
+        let schedules = normalize_service_schedules(&name, &allowed_get_endpoints, &raw_schedules)?;
 
         services.push(Service {
             name,
             prefix,
             base_url: url,
             allowed_get_endpoints,
+            schedules,
         });
     }
 
@@ -164,6 +214,117 @@ fn read_service_openapi(name: &str) -> Result<HashSet<String>> {
     })
 }
 
+fn parse_schedule_from_array(items: Vec<Value>) -> Result<RawScheduleConfig, String> {
+    if items.len() != 2 {
+        return Err("schedule array must contain exactly two items".to_string());
+    }
+
+    let endpoint = items
+        .get(0)
+        .and_then(Value::as_str)
+        .ok_or_else(|| "schedule array first item must be a string endpoint".to_string())?
+        .to_owned();
+
+    let interval_value = items
+        .get(1)
+        .ok_or_else(|| "schedule array second item must be an interval".to_string())?;
+
+    let interval_secs = parse_interval_value(interval_value)?;
+
+    Ok(RawScheduleConfig {
+        endpoint,
+        interval_secs,
+    })
+}
+
+fn parse_schedule_from_object(
+    mut map: serde_json::Map<String, Value>,
+) -> Result<RawScheduleConfig, String> {
+    if map.len() == 1 {
+        if let Some((key, value)) = map.iter().next() {
+            let special_key = matches!(
+                key.as_str(),
+                "endpoint" | "path" | "interval" | "interval_secs" | "seconds" | "every_secs"
+            );
+
+            if !special_key {
+                let interval_secs = parse_interval_value(value)?;
+                return Ok(RawScheduleConfig {
+                    endpoint: key.clone(),
+                    interval_secs,
+                });
+            }
+        }
+    }
+
+    let endpoint_value = map
+        .remove("endpoint")
+        .or_else(|| map.remove("path"))
+        .ok_or_else(|| "schedule object missing 'endpoint' field".to_string())?;
+
+    let endpoint = endpoint_value
+        .as_str()
+        .ok_or_else(|| "schedule 'endpoint' must be a string".to_string())?
+        .to_owned();
+
+    let interval_value = map
+        .remove("interval_secs")
+        .or_else(|| map.remove("seconds"))
+        .or_else(|| map.remove("interval"))
+        .or_else(|| map.remove("every_secs"))
+        .ok_or_else(|| "schedule object missing interval field".to_string())?;
+
+    let interval_secs = parse_interval_value(&interval_value)?;
+
+    Ok(RawScheduleConfig {
+        endpoint,
+        interval_secs,
+    })
+}
+
+fn parse_interval_value(value: &Value) -> Result<u64, String> {
+    value
+        .as_u64()
+        .ok_or_else(|| "schedule interval must be a positive integer".to_string())
+}
+
+fn normalize_service_schedules(
+    service_name: &str,
+    allowed_endpoints: &HashSet<String>,
+    raw_schedules: &[RawScheduleConfig],
+) -> Result<Vec<ServiceSchedule>> {
+    let mut schedules = Vec::new();
+
+    for (idx, raw) in raw_schedules.iter().enumerate() {
+        let endpoint = raw.endpoint.trim().trim_matches('/');
+
+        if endpoint.is_empty() {
+            bail!(
+                "schedule entry #{idx} for service '{service_name}' must declare a non-empty endpoint"
+            );
+        }
+
+        if raw.interval_secs == 0 {
+            bail!(
+                "schedule entry '/{endpoint}' for service '{service_name}' must declare an interval greater than zero"
+            );
+        }
+
+        if !allowed_endpoints.contains(endpoint) {
+            bail!(
+                "schedule endpoint '/{endpoint}' for service '{service_name}' is not declared in its OpenAPI document"
+            );
+        }
+
+        schedules.push(ServiceSchedule {
+            endpoint: endpoint.to_string(),
+            interval_secs: raw.interval_secs,
+        });
+    }
+
+    Ok(schedules)
+}
+
 fn collect_get_endpoints(document: &Value) -> Result<HashSet<String>> {
     let paths = document
         .get("paths")
@@ -214,6 +375,7 @@ mod tests {
             prefix: "foo".into(),
             base_url: "http://localhost".into(),
             allowed_get_endpoints: ["ping".into()].into_iter().collect(),
+            schedules: Vec::new(),
         };
 
         assert!(service.supports(&Method::Get, "ping"));
@@ -254,5 +416,44 @@ mod tests {
 
         let error = collect_get_endpoints(&document).unwrap_err();
         assert!(error.to_string().contains("does not declare any GET"));
+    }
+
+    #[test]
+    fn parse_schedule_entries_from_multiple_formats() {
+        let raw: Vec<RawScheduleConfig> = serde_json::from_value(json!([
+            ["/ping", 30],
+            {"endpoint": "hello", "seconds": 45},
+            {"/health": 5}
+        ]))
+        .expect("parse schedules");
+
+        let allowed = ["ping", "hello", "health"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let schedules =
+            normalize_service_schedules("svc", &allowed, &raw).expect("normalize schedules");
+
+        assert_eq!(schedules.len(), 3);
+        assert_eq!(schedules[0].endpoint, "ping");
+        assert_eq!(schedules[0].interval_secs, 30);
+        assert_eq!(schedules[1].endpoint, "hello");
+        assert_eq!(schedules[1].interval_secs, 45);
+        assert_eq!(schedules[2].endpoint, "health");
+        assert_eq!(schedules[2].interval_secs, 5);
+    }
+
+    #[test]
+    fn normalize_schedules_rejects_unknown_endpoint() {
+        let raw: Vec<RawScheduleConfig> =
+            serde_json::from_value(json!([["/unknown", 10]])).expect("parse schedules");
+
+        let allowed = ["ping"].into_iter().map(String::from).collect();
+
+        let error = normalize_service_schedules("svc", &allowed, &raw).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("is not declared in its OpenAPI document"));
     }
 }

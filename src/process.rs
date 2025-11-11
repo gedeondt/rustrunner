@@ -313,6 +313,7 @@ mod tests {
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
             allowed_get_endpoints: Default::default(),
+            schedules: Vec::new(),
         };
 
         let path = crate::config::service_manifest_path(&service.name);
