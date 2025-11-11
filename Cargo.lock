@@ -349,6 +349,7 @@ dependencies = [
  "serde_json",
  "tiny_http",
  "ureq",
+ "url",
 ]
 
 [[package]]
