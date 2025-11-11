@@ -1,10 +1,13 @@
 use anyhow::{anyhow, Result};
 use std::io::Cursor;
+use std::time::Instant;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::config::Service;
 use crate::health::{HealthStatus, SharedHealthMap};
 use crate::logs::SharedLogMap;
+use crate::scheduler::{self, ScheduleState, SharedScheduleMap, ToggleError};
+use serde_json::json;
 
 const ENTRY_PORT: u16 = 14000;
 
@@ -12,6 +15,7 @@ pub fn run_server(
     services: &[Service],
     health: &SharedHealthMap,
     logs: &SharedLogMap,
+    schedules: &SharedScheduleMap,
 ) -> Result<()> {
     let server = Server::http(("0.0.0.0", ENTRY_PORT)).map_err(|error| {
         anyhow!(
@@ -24,7 +28,7 @@ pub fn run_server(
     println!("Runner listening on http://{}:{}", "0.0.0.0", ENTRY_PORT);
 
     for request in server.incoming_requests() {
-        if let Err(error) = handle_request(services, health, logs, request) {
+        if let Err(error) = handle_request(services, health, logs, schedules, request) {
             eprintln!("Failed to handle request: {:#}", error);
         }
     }
@@ -36,6 +40,7 @@ fn handle_request(
     services: &[Service],
     health: &SharedHealthMap,
     logs: &SharedLogMap,
+    schedules: &SharedScheduleMap,
     request: Request,
 ) -> Result<()> {
     if request.method() != &Method::Get {
@@ -59,13 +64,13 @@ fn handle_request(
     }
 
     if trimmed_path.is_empty() {
-        let response = render_homepage(services, health);
+        let response = render_homepage(services, health, schedules);
         request.respond(response)?;
         return Ok(());
     }
 
     if let Some(rest) = trimmed_path.strip_prefix("__runner__/services/") {
-        return handle_internal_service_request(services, logs, request, rest);
+        return handle_internal_service_request(services, logs, schedules, request, rest);
     }
 
     let Some((service, endpoint_path)) = resolve_service_route(services, trimmed_path) else {
@@ -113,6 +118,7 @@ fn handle_request(
 fn handle_internal_service_request(
     services: &[Service],
     logs: &SharedLogMap,
+    schedules: &SharedScheduleMap,
     request: Request,
     rest: &str,
 ) -> Result<()> {
@@ -135,8 +141,15 @@ fn handle_internal_service_request(
         return Ok(());
     }
 
+    let remaining: Vec<_> = segments.collect();
+
     match action {
         "logs" => {
+            if !remaining.is_empty() {
+                let response = Response::from_string("not found").with_status_code(404);
+                request.respond(response)?;
+                return Ok(());
+            }
             let body = match logs.lock() {
                 Ok(store) => match store.get(service_name) {
                     Some(lines) if !lines.is_empty() => {
@@ -161,6 +174,11 @@ fn handle_internal_service_request(
             request.respond(response)?;
         }
         "openapi" => {
+            if !remaining.is_empty() {
+                let response = Response::from_string("not found").with_status_code(404);
+                request.respond(response)?;
+                return Ok(());
+            }
             let path = crate::config::openapi_path(service_name);
             match std::fs::read_to_string(&path) {
                 Ok(contents) => {
@@ -179,6 +197,9 @@ fn handle_internal_service_request(
                 }
             }
         }
+        "schedules" => {
+            return handle_schedule_request(service_name, schedules, request, &remaining);
+        }
         _ => {
             let response = Response::from_string("not found").with_status_code(404);
             request.respond(response)?;
@@ -186,6 +207,157 @@ fn handle_internal_service_request(
     }
 
     Ok(())
+}
+
+fn handle_schedule_request(
+    service_name: &str,
+    schedules: &SharedScheduleMap,
+    request: Request,
+    remaining: &[&str],
+) -> Result<()> {
+    if remaining.len() != 2 || remaining[1] != "toggle" {
+        let response = Response::from_string("not found").with_status_code(404);
+        request.respond(response)?;
+        return Ok(());
+    }
+
+    let index: usize = match remaining[0].parse() {
+        Ok(value) => value,
+        Err(_) => {
+            let response = Response::from_string("invalid schedule index").with_status_code(400);
+            request.respond(response)?;
+            return Ok(());
+        }
+    };
+
+    match scheduler::toggle_schedule(schedules, service_name, index) {
+        Ok(paused) => {
+            let payload = json!({ "paused": paused });
+            let mut response = Response::from_string(payload.to_string()).with_status_code(200);
+            if let Ok(header) = Header::from_bytes(b"Content-Type", b"application/json") {
+                response = response.with_header(header);
+            }
+            request.respond(response)?;
+        }
+        Err(ToggleError::ServiceNotFound | ToggleError::ScheduleNotFound) => {
+            let response = Response::from_string("not found").with_status_code(404);
+            request.respond(response)?;
+        }
+        Err(ToggleError::LockPoisoned) => {
+            let response =
+                Response::from_string("schedule controller unavailable").with_status_code(503);
+            request.respond(response)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_schedule_section(service_name: &str, entries: Option<&Vec<ScheduleState>>) -> String {
+    let Some(entries) = entries else {
+        return concat!(
+            "<div class=\"schedule-section\">",
+            "  <h4>Webhooks programados</h4>",
+            "  <p class=\"schedule-empty\">No hay webhooks programados.</p>",
+            "</div>"
+        )
+        .to_string();
+    };
+
+    if entries.is_empty() {
+        return concat!(
+            "<div class=\"schedule-section\">",
+            "  <h4>Webhooks programados</h4>",
+            "  <p class=\"schedule-empty\">No hay webhooks programados.</p>",
+            "</div>"
+        )
+        .to_string();
+    }
+
+    let mut items = String::new();
+
+    for (index, state) in entries.iter().enumerate() {
+        let endpoint_display = format!("/{}", state.endpoint);
+        let state_label = if state.paused {
+            "⏸️ Pausado"
+        } else {
+            "▶️ En ejecución"
+        };
+        let button_label = if state.paused { "Reanudar" } else { "Pausar" };
+        let paused_attr = if state.paused { "true" } else { "false" };
+
+        let status_text = if let Some(error) = &state.last_error {
+            format!("Último error: {error}")
+        } else if let Some(status) = state.last_status {
+            format!("Último HTTP: {status}")
+        } else {
+            "Aún no se ha ejecutado.".to_string()
+        };
+
+        let time_text = match state.last_run {
+            Some(instant) => describe_elapsed("Última ejecución", instant),
+            None => "Pendiente de la primera ejecución".to_string(),
+        };
+
+        items.push_str(&format!(
+            concat!(
+                "<li class=\"schedule-item\" data-service=\"{service}\" data-index=\"{index}\">",
+                "  <div class=\"schedule-item__header\">",
+                "    <span><code>{endpoint}</code></span>",
+                "    <span class=\"schedule-item__meta\">Cada {interval}s · <span class=\"schedule-item__state\">{state_label}</span></span>",
+                "    <button type=\"button\" class=\"schedule-toggle\" data-service=\"{service}\" data-index=\"{index}\" data-paused=\"{paused}\">{button_label}</button>",
+                "  </div>",
+                "  <div class=\"schedule-item__details\">",
+                "    <small class=\"schedule-item__result\">{status_text}</small><br/>",
+                "    <small class=\"schedule-item__time\">{time_text}</small>",
+                "  </div>",
+                "</li>"
+            ),
+            service = service_name,
+            index = index,
+            endpoint = escape_html(&endpoint_display),
+            interval = state.interval_secs,
+            state_label = state_label,
+            paused = paused_attr,
+            button_label = button_label,
+            status_text = escape_html(&status_text),
+            time_text = escape_html(&time_text)
+        ));
+    }
+
+    format!(
+        concat!(
+            "<div class=\"schedule-section\">",
+            "  <h4>Webhooks programados</h4>",
+            "  <ul class=\"schedule-list\">{items}</ul>",
+            "</div>"
+        ),
+        items = items
+    )
+}
+
+fn describe_elapsed(prefix: &str, instant: Instant) -> String {
+    let seconds = instant.elapsed().as_secs();
+    match seconds {
+        0 => format!("{prefix} hace menos de un segundo"),
+        1 => format!("{prefix} hace 1 segundo"),
+        _ => format!("{prefix} hace {seconds} segundos"),
+    }
+}
+
+fn escape_html(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn resolve_service_route<'a>(
@@ -224,12 +396,17 @@ fn build_response(upstream: ureq::Response) -> Result<Response<Cursor<Vec<u8>>>>
     Ok(response)
 }
 
-fn render_homepage(services: &[Service], health: &SharedHealthMap) -> Response<Cursor<Vec<u8>>> {
+fn render_homepage(
+    services: &[Service],
+    health: &SharedHealthMap,
+    schedules: &SharedScheduleMap,
+) -> Response<Cursor<Vec<u8>>> {
     let service_section = if services.is_empty() {
         "<p>No hay servicios cargados actualmente.</p>".to_string()
     } else {
         let mut items = String::new();
         let health_snapshot = health.lock().map(|map| map.clone()).unwrap_or_default();
+        let schedule_snapshot = schedules.lock().map(|map| map.clone()).unwrap_or_default();
         for service in services {
             let health_info = health_snapshot
                 .get(&service.name)
@@ -252,6 +429,9 @@ fn render_homepage(services: &[Service], health: &SharedHealthMap) -> Response<C
                 None => "Última verificación pendiente".to_string(),
             };
 
+            let schedule_section =
+                build_schedule_section(&service.name, schedule_snapshot.get(&service.name));
+
             let item = format!(
                 concat!(
                     "<li>",
@@ -266,6 +446,7 @@ fn render_homepage(services: &[Service], health: &SharedHealthMap) -> Response<C
                     "  <span>Prefijo: <code>{prefix}</code></span><br/>",
                     "  <span>Base URL: <code>{base_url}</code></span><br/>",
                     "  <small>{last_checked}</small>",
+                    "  {schedule_section}",
                     "</li>"
                 ),
                 name = service.name,
@@ -273,7 +454,8 @@ fn render_homepage(services: &[Service], health: &SharedHealthMap) -> Response<C
                 status_label = status_label,
                 prefix = service.prefix,
                 base_url = service.base_url,
-                last_checked = last_checked
+                last_checked = last_checked,
+                schedule_section = schedule_section
             );
 
             items.push_str(&item);
@@ -301,6 +483,20 @@ fn render_homepage(services: &[Service], health: &SharedHealthMap) -> Response<C
             "      .status--healthy {{ color: #0a7d24; }}\n",
             "      .status--unhealthy {{ color: #c62828; }}\n",
             "      .status--unknown {{ color: #616161; }}\n",
+            "      .schedule-section {{ margin-top: 0.75rem; padding: 0.75rem; background-color: rgba(74, 144, 226, 0.08); border-radius: 6px; }}\n",
+            "      .schedule-section h4 {{ margin: 0 0 0.5rem 0; font-size: 1rem; }}\n",
+            "      .schedule-empty {{ margin: 0; font-style: italic; color: #355a7a; }}\n",
+            "      .schedule-list {{ list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.5rem; }}\n",
+            "      .schedule-item {{ border: 1px solid rgba(74, 144, 226, 0.25); border-radius: 6px; padding: 0.6rem 0.75rem; background-color: rgba(255, 255, 255, 0.75); }}\n",
+            "      .schedule-item__header {{ display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; justify-content: space-between; }}\n",
+            "      .schedule-item__meta {{ font-size: 0.9rem; color: #1a4971; }}\n",
+            "      .schedule-item__state {{ font-weight: 600; }}\n",
+            "      .schedule-item__details {{ margin-top: 0.35rem; display: flex; flex-direction: column; gap: 0.2rem; }}\n",
+            "      .schedule-item__result {{ color: #333333; }}\n",
+            "      .schedule-item__time {{ color: #555555; }}\n",
+            "      .schedule-toggle {{ border: none; background-color: #1a73e8; color: #ffffff; padding: 0.3rem 0.75rem; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }}\n",
+            "      .schedule-toggle[data-paused='true'] {{ background-color: #2e7d32; }}\n",
+            "      .schedule-toggle:disabled {{ opacity: 0.6; cursor: progress; }}\n",
             "      .modal {{ position: fixed; inset: 0; background-color: rgba(0, 0, 0, 0.4); display: flex; align-items: center; justify-content: center; padding: 1rem; z-index: 1000; }}\n",
             "      .modal[hidden] {{ display: none; }}\n",
             "      .modal__dialog {{ background: #ffffff; color: #000000; width: min(90vw, 720px); max-height: 80vh; border-radius: 8px; box-shadow: 0 20px 45px rgba(0, 0, 0, 0.2); display: flex; flex-direction: column; overflow: hidden; }}\n",
@@ -378,6 +574,53 @@ fn render_homepage(services: &[Service], health: &SharedHealthMap) -> Response<C
             "          }});\n",
             "        }});\n",
             "\n",
+            "        document.querySelectorAll('.schedule-item__result').forEach((resultEl) => {{\n",
+            "          if (!resultEl.dataset.originalText) {{\n",
+            "            resultEl.dataset.originalText = resultEl.textContent || '';\n",
+            "          }}\n",
+            "        }});\n",
+            "\n",
+            "        document.querySelectorAll('.schedule-toggle').forEach((button) => {{\n",
+            "          button.addEventListener('click', async () => {{\n",
+            "            const service = button.getAttribute('data-service');\n",
+            "            const index = button.getAttribute('data-index');\n",
+            "            if (!service || index === null) {{\n",
+            "              return;\n",
+            "            }}\n",
+            "            const item = button.closest('.schedule-item');\n",
+            "            const stateEl = item ? item.querySelector('.schedule-item__state') : null;\n",
+            "            const resultEl = item ? item.querySelector('.schedule-item__result') : null;\n",
+            "            if (resultEl && !resultEl.dataset.originalText) {{\n",
+            "              resultEl.dataset.originalText = resultEl.textContent || '';\n",
+            "            }}\n",
+            "            button.disabled = true;\n",
+            "            try {{\n",
+            "              const response = await fetch('/__runner__/services/' + encodeURIComponent(service) + '/schedules/' + index + '/toggle');\n",
+            "              if (!response.ok) {{\n",
+            "                const text = await response.text();\n",
+            "                throw new Error(text || ('Error ' + response.status));\n",
+            "              }}\n",
+            "              const payload = await response.json();\n",
+            "              const paused = Boolean(payload.paused);\n",
+            "              button.dataset.paused = paused ? 'true' : 'false';\n",
+            "              button.textContent = paused ? 'Reanudar' : 'Pausar';\n",
+            "              if (stateEl) {{\n",
+            "                stateEl.textContent = paused ? '⏸️ Pausado' : '▶️ En ejecución';\n",
+            "              }}\n",
+            "              if (resultEl) {{\n",
+            "                const baseText = resultEl.dataset.originalText || '';\n",
+            "                resultEl.textContent = baseText + ' · Estado: ' + (paused ? 'pausado' : 'en ejecución');\n",
+            "              }}\n",
+            "            }} catch (error) {{\n",
+            "              if (resultEl) {{\n",
+            "                resultEl.textContent = 'Error al actualizar: ' + error.message;\n",
+            "              }}\n",
+            "            }} finally {{\n",
+            "              button.disabled = false;\n",
+            "            }}\n",
+            "          }});\n",
+            "        }});\n",
+            "\n",
             "        closeBtn.addEventListener('click', closeModal);\n",
             "        modal.addEventListener('click', (event) => {{\n",
             "          if (event.target === modal) {{\n",
@@ -417,6 +660,7 @@ mod tests {
             base_url: "http://localhost:1234".into(),
             memory_limit_bytes: 64 * 1024 * 1024,
             allowed_get_endpoints: Default::default(),
+            schedules: Vec::new(),
         };
         let services = vec![service];
 
@@ -435,6 +679,7 @@ mod tests {
             base_url: "http://localhost:1234".into(),
             memory_limit_bytes: 64 * 1024 * 1024,
             allowed_get_endpoints: Default::default(),
+            schedules: Vec::new(),
         };
         let services = vec![service];
 

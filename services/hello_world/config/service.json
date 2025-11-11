@@ -1,5 +1,11 @@
 {
   "prefix": "hello",
   "url": "http://127.0.0.1:15001",
-  "memory_limit_mb": 64
+  "memory_limit_mb": 64,
+  "schedules": [
+    {
+      "endpoint": "/hello",
+      "interval_secs": 60
+    }
+  ]
 }

@@ -15,6 +15,9 @@ servicio configurado.
   servicio.
 * **Panel web**: en `http://127.0.0.1:14000` se genera un resumen dinámico con el estado de
   salud (en línea, fuera de servicio o sin datos) y la marca de tiempo de la última verificación.
+* **Webhooks programados**: los servicios pueden solicitar que el runner invoque ciertos endpoints
+  cada X segundos. El panel permite revisar el resultado más reciente de cada tarea y pausarla o
+  reanudarla en caliente.
 * **Endpoint de salud del runner**: el propio runner responde `200 OK` en `/health` para
   integrarse con herramientas externas.
 
