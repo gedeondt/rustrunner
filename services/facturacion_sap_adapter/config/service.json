@@ -2,5 +2,8 @@
   "prefix": "sap-adapter",
   "url": "http://127.0.0.1:15003",
   "domain": "facturacion",
-  "type": "adapter"
+  "type": "adapter",
+  "listeners": [
+    { "queue": "clientes.actualizado", "path": "/queues/cliente-actualizado" }
+  ]
 }
