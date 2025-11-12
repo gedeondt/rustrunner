@@ -1,0 +1,92 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Servicio de cuenta de cliente",
+    "version": "1.0.0",
+    "description": "Servicio de negocio que expone la información detallada de cuentas de clientes."
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Verifica la salud del servicio",
+        "responses": {
+          "200": {
+            "description": "El servicio está disponible."
+          }
+        }
+      }
+    },
+    "/accounts/{accountId}": {
+      "get": {
+        "summary": "Resumen principal de la cuenta",
+        "parameters": [
+          {
+            "name": "accountId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Datos de estado, saldo y disponibilidad."
+          }
+        }
+      }
+    },
+    "/accounts/{accountId}/holders": {
+      "get": {
+        "summary": "Lista de titulares y cotitulares",
+        "parameters": [
+          {
+            "name": "accountId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Titulares vinculados a la cuenta."
+          }
+        }
+      }
+    },
+    "/accounts/{accountId}/limits": {
+      "get": {
+        "summary": "Límites operativos vigentes",
+        "parameters": [
+          {
+            "name": "accountId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Topes diarios y disponibilidad restante."
+          }
+        }
+      }
+    },
+    "/accounts/{accountId}/movements": {
+      "get": {
+        "summary": "Movimientos recientes",
+        "parameters": [
+          {
+            "name": "accountId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Últimas operaciones registradas."
+          }
+        }
+      }
+    }
+  }
+}

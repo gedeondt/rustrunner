@@ -305,11 +305,14 @@ fn probe_service(service: &Service) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServiceKind;
 
     #[test]
     fn manifest_path_uses_service_name() {
         let service = Service {
             name: "svc".into(),
+            domain: "demo".into(),
+            kind: ServiceKind::Business,
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
             allowed_get_endpoints: Default::default(),

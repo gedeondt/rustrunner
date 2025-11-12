@@ -1,0 +1,92 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Adapter SAP Facturación",
+    "version": "1.0.0",
+    "description": "Adapter que aproxima la API de SAP con datos de deuda y facturas de clientes."
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Verifica la salud del servicio",
+        "responses": {
+          "200": {
+            "description": "El servicio está disponible."
+          }
+        }
+      }
+    },
+    "/sap/customers/{customerId}/debt": {
+      "get": {
+        "summary": "Consulta la deuda abierta de un cliente",
+        "parameters": [
+          {
+            "name": "customerId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Importes totales y vencidos según SAP."
+          }
+        }
+      }
+    },
+    "/sap/customers/{customerId}/invoices": {
+      "get": {
+        "summary": "Recupera las facturas abiertas",
+        "parameters": [
+          {
+            "name": "customerId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Listado de facturas con estado y fechas."
+          }
+        }
+      }
+    },
+    "/sap/customers/{customerId}/status": {
+      "get": {
+        "summary": "Estado de riesgo del cliente",
+        "parameters": [
+          {
+            "name": "customerId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Información de riesgo y bloqueo."
+          }
+        }
+      }
+    },
+    "/sap/customers/{customerId}/contacts": {
+      "get": {
+        "summary": "Contactos útiles dentro de SAP",
+        "parameters": [
+          {
+            "name": "customerId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Contactos operativos para coordinar cobros."
+          }
+        }
+      }
+    }
+  }
+}

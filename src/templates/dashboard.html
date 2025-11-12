@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Servicios disponibles</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            night: {
+              900: '#020617',
+              800: '#0f172a'
+            }
+          },
+          boxShadow: {
+            glow: '0 25px 80px rgba(15, 23, 42, 0.6)'
+          }
+        }
+      }
+    };
+  </script>
+</head>
+<body class="bg-night-900 text-slate-100 min-h-screen">
+  <main class="mx-auto flex max-w-6xl flex-col gap-8 px-4 py-10">
+    <header class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+      <div class="space-y-2">
+        <h1 class="text-3xl font-semibold tracking-tight text-white">Servicios disponibles</h1>
+        <p class="text-sm text-slate-400">Estos son los servicios registrados actualmente en el runner.</p>
+      </div>
+      <div class="flex items-center gap-3">
+        <button
+          type="button"
+          id="stats-button"
+          class="icon-button inline-flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-900/70 px-4 py-2 text-sm font-medium text-slate-200 shadow shadow-slate-950/40 transition hover:bg-slate-900 focus:outline-none focus:ring focus:ring-slate-500/40"
+          title="Ver estadísticas"
+          aria-label="Ver estadísticas"
+        >
+          📈<span class="hidden sm:inline">Estadísticas</span>
+        </button>
+      </div>
+    </header>
+    {{service_section}}
+    <section class="rounded-2xl border border-slate-800 bg-slate-900/60 p-6 shadow-glow shadow-slate-950/30">
+      <h2 class="text-2xl font-semibold text-white">Colas internas</h2>
+      <div class="mt-4" id="queues">
+        {{queue_section}}
+      </div>
+    </section>
+  </main>
+
+  <div id="modal" class="modal fixed inset-0 hidden items-center justify-center bg-slate-950/60 p-4">
+    <div class="modal__dialog w-full max-w-3xl overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 shadow-glow shadow-slate-950/40">
+      <div class="modal__header flex items-center justify-between border-b border-slate-800 px-5 py-4">
+        <h2 id="modal-title" class="modal__title text-lg font-semibold text-white"></h2>
+        <button type="button" class="modal__close text-2xl leading-none text-slate-400 transition hover:text-slate-200" aria-label="Cerrar">✖</button>
+      </div>
+      <div class="modal__body max-h-[60vh] overflow-auto bg-slate-950/40 px-5 py-4">
+        <pre id="modal-content" class="whitespace-pre-wrap text-sm leading-relaxed text-slate-300"></pre>
+      </div>
+    </div>
+  </div>
+
+  <div id="stats-modal" class="modal fixed inset-0 hidden items-center justify-center bg-slate-950/60 p-4">
+    <div class="modal__dialog w-full max-w-3xl overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 shadow-glow shadow-slate-950/40">
+      <div class="modal__header flex items-center justify-between border-b border-slate-800 px-5 py-4">
+        <h2 id="stats-modal-title" class="modal__title text-lg font-semibold text-white">Estadísticas de respuestas</h2>
+        <button type="button" class="modal__close text-2xl leading-none text-slate-400 transition hover:text-slate-200" aria-label="Cerrar">✖</button>
+      </div>
+      <div class="modal__body max-h-[60vh] overflow-auto bg-slate-950/40 px-5 py-4">
+        <p id="stats-empty" class="stats-empty text-center text-sm text-slate-400">Sin datos disponibles todavía.</p>
+        <canvas id="stats-chart" class="stats-modal__canvas mt-4 hidden w-full" width="600" height="320"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script>
+    (function() {
+      const modal = document.getElementById('modal');
+      const titleEl = document.getElementById('modal-title');
+      const contentEl = document.getElementById('modal-content');
+      const modalCloseButtons = modal.querySelectorAll('.modal__close');
+      const statsModal = document.getElementById('stats-modal');
+      const statsButton = document.getElementById('stats-button');
+      const statsCloseButtons = statsModal.querySelectorAll('.modal__close');
+      const statsCanvas = document.getElementById('stats-chart');
+      const statsEmpty = document.getElementById('stats-empty');
+      const ACTION_LABELS = { logs: 'Logs', openapi: 'OpenAPI' };
+
+      function showElement(element) {
+        element.classList.remove('hidden');
+        element.removeAttribute('hidden');
+      }
+
+      function hideElement(element) {
+        element.classList.add('hidden');
+        element.setAttribute('hidden', 'hidden');
+      }
+
+      function closeModal() {
+        hideElement(modal);
+        contentEl.textContent = '';
+      }
+
+      async function openModal(action, service) {
+        const label = ACTION_LABELS[action] || 'Detalles';
+        titleEl.textContent = label + ' — ' + service;
+        contentEl.textContent = 'Cargando...';
+        showElement(modal);
+
+        try {
+          const response = await fetch('/__runner__/services/' + encodeURIComponent(service) + '/' + action);
+          if (!response.ok) {
+            const text = await response.text();
+            throw new Error(text || ('Error ' + response.status));
+          }
+          let text = await response.text();
+          if (action === 'openapi' && text) {
+            try {
+              const parsed = JSON.parse(text);
+              text = JSON.stringify(parsed, null, 2);
+            } catch (_) {
+              // mantener formato original
+            }
+          }
+          contentEl.textContent = text || 'Sin contenido disponible.';
+        } catch (error) {
+          contentEl.textContent = 'Error al cargar: ' + error.message;
+        }
+      }
+
+      document.querySelectorAll('[data-action][data-service]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const action = button.getAttribute('data-action');
+          const service = button.getAttribute('data-service');
+          if (action && service) {
+            openModal(action, service);
+          }
+        });
+      });
+
+      modalCloseButtons.forEach((button) => {
+        button.addEventListener('click', closeModal);
+      });
+
+      modal.addEventListener('click', (event) => {
+        if (event.target === modal) {
+          closeModal();
+        }
+      });
+
+      function closeStatsModal() {
+        hideElement(statsModal);
+      }
+
+      statsCloseButtons.forEach((button) => {
+        button.addEventListener('click', closeStatsModal);
+      });
+
+      statsModal.addEventListener('click', (event) => {
+        if (event.target === statsModal) {
+          closeStatsModal();
+        }
+      });
+
+      async function fetchStats() {
+        try {
+          const response = await fetch('/__runner__/stats');
+          if (!response.ok) {
+            throw new Error('No se pudieron obtener las estadísticas');
+          }
+          const payload = await response.json();
+          return payload || {};
+        } catch (error) {
+          console.error('Stats error', error);
+          return {};
+        }
+      }
+
+      function renderStatsChart(data) {
+        const entries = Object.entries(data);
+        if (entries.length === 0) {
+          hideElement(statsCanvas);
+          showElement(statsEmpty);
+          return;
+        }
+
+        const labels = entries.map(([label]) => label);
+        const values = entries.map(([, counts]) => counts.reduce((acc, value) => acc + value, 0));
+
+        hideElement(statsEmpty);
+        showElement(statsCanvas);
+
+        new Chart(statsCanvas, {
+          type: 'bar',
+          data: {
+            labels,
+            datasets: [
+              {
+                label: 'Respuestas registradas',
+                data: values,
+                backgroundColor: 'rgba(94, 234, 212, 0.6)',
+                borderColor: 'rgba(94, 234, 212, 1)',
+                borderWidth: 1,
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            scales: {
+              y: {
+                beginAtZero: true,
+                ticks: {
+                  color: '#cbd5f5'
+                },
+                grid: {
+                  color: 'rgba(148, 163, 184, 0.2)'
+                }
+              },
+              x: {
+                ticks: {
+                  color: '#cbd5f5'
+                },
+                grid: {
+                  color: 'rgba(148, 163, 184, 0.2)'
+                }
+              }
+            },
+            plugins: {
+              legend: {
+                labels: {
+                  color: '#e2e8f0'
+                }
+              }
+            }
+          },
+        });
+      }
+
+      statsButton.addEventListener('click', async () => {
+        showElement(statsModal);
+        const data = await fetchStats();
+        renderStatsChart(data);
+      });
+
+      document.querySelectorAll('.schedule-item__result').forEach((resultEl) => {
+        if (!resultEl.dataset.originalText) {
+          resultEl.dataset.originalText = resultEl.textContent || '';
+        }
+      });
+
+      document.querySelectorAll('.schedule-toggle').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const service = button.getAttribute('data-service');
+          const index = button.getAttribute('data-index');
+          if (!service || index === null) {
+            return;
+          }
+
+          button.disabled = true;
+          try {
+            const response = await fetch('/__runner__/schedules/' + encodeURIComponent(service) + '/' + index, {
+              method: 'POST',
+            });
+            if (!response.ok) {
+              throw new Error('No se pudo actualizar el schedule');
+            }
+            const payload = await response.json();
+            const paused = Boolean(payload && payload.paused);
+            button.dataset.paused = paused ? 'true' : 'false';
+            button.textContent = paused ? 'Reanudar' : 'Pausar';
+            const stateEl = button.closest('.schedule-item').querySelector('.schedule-item__state');
+            if (stateEl) {
+              stateEl.textContent = paused ? '⏸️ Pausado' : '▶️ En ejecución';
+            }
+          } catch (error) {
+            console.error('schedule toggle failed', error);
+          } finally {
+            button.disabled = false;
+          }
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,92 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "BFF Atención Clientes",
+    "version": "1.0.0",
+    "description": "Backend for Frontend que expone los datos agregados para la aplicación móvil de clientes."
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Verifica la salud del servicio",
+        "responses": {
+          "200": {
+            "description": "El servicio está disponible."
+          }
+        }
+      }
+    },
+    "/clients/{clientId}/summary": {
+      "get": {
+        "summary": "Resumen agregado del cliente",
+        "parameters": [
+          {
+            "name": "clientId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Información de perfil y productos destacados."
+          }
+        }
+      }
+    },
+    "/clients/{clientId}/products": {
+      "get": {
+        "summary": "Listado de productos activos",
+        "parameters": [
+          {
+            "name": "clientId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Colección de cuentas, tarjetas y préstamos con datos precalculados."
+          }
+        }
+      }
+    },
+    "/clients/{clientId}/alerts": {
+      "get": {
+        "summary": "Alertas recientes relevantes",
+        "parameters": [
+          {
+            "name": "clientId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Últimas alertas operativas y de seguridad."
+          }
+        }
+      }
+    },
+    "/clients/{clientId}/contact": {
+      "get": {
+        "summary": "Información de contacto asignada",
+        "parameters": [
+          {
+            "name": "clientId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Gestor personal y oficina preferida."
+          }
+        }
+      }
+    }
+  }
+}

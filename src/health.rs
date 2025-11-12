@@ -90,11 +90,14 @@ fn healthcheck_url(service: &Service) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServiceKind;
 
     #[test]
     fn healthcheck_url_trims_trailing_slashes() {
         let service = Service {
             name: "svc".into(),
+            domain: "demo".into(),
+            kind: ServiceKind::Business,
             prefix: "svc".into(),
             base_url: "http://localhost:1234/".into(),
             allowed_get_endpoints: Default::default(),
@@ -109,6 +112,8 @@ mod tests {
     fn start_health_monitor_initializes_map() {
         let service = Service {
             name: "svc".into(),
+            domain: "demo".into(),
+            kind: ServiceKind::Business,
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
             allowed_get_endpoints: Default::default(),
