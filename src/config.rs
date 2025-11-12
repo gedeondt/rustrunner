@@ -137,6 +137,17 @@ pub fn load_services() -> Result<Vec<Service>> {
             continue;
         }
 
+        let manifest_path = service_manifest_path(&name);
+
+        if !manifest_path.exists() {
+            println!(
+                "Skipping service '{}' because manifest was not found at {}",
+                name,
+                manifest_path.display()
+            );
+            continue;
+        }
+
         let RawServiceConfig {
             prefix,
             url,
