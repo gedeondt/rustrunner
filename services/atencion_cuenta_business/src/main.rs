@@ -1,4 +1,7 @@
+use std::env;
 use std::io::Write;
+use std::thread;
+use std::time::Duration;
 
 use env_logger::{Builder, Env, Target};
 use log::{error, info, warn};
@@ -14,12 +17,18 @@ struct EndpointResponse {
 
 const SERVICE_NAME: &str = "cuenta-cliente-business";
 const PORT: u16 = 15002;
+const DEFAULT_RUNNER_BASE_URL: &str = "http://127.0.0.1:14000";
+const CUSTOMER_UPDATE_QUEUE: &str = "clientes.actualizado";
+const CUSTOMER_UPDATE_EVENT: &str = "ClienteActualizado";
+const CUSTOMER_UPDATE_INTERVAL_SECS: u64 = 30;
 
 fn main() {
     Builder::from_env(Env::default().default_filter_or("info"))
         .format(|buf, record| writeln!(buf, "[{}] {}", record.level(), record.args()))
         .target(Target::Stdout)
         .init();
+
+    start_customer_update_scheduler();
 
     let server = Server::http(("0.0.0.0", PORT)).expect("failed to bind atención cuenta business service");
     info!(
@@ -142,6 +151,58 @@ fn json_response(payload: serde_json::Value) -> EndpointResponse {
         status: 200,
         body: payload.to_string(),
         content_type: "application/json",
+    }
+}
+
+fn start_customer_update_scheduler() {
+    let runner_base_url = env::var("RUNNER_BASE_URL").unwrap_or_else(|_| DEFAULT_RUNNER_BASE_URL.to_string());
+    let publish_url = format!(
+        "{}/__runner__/queues/{}",
+        runner_base_url.trim_end_matches('/'),
+        CUSTOMER_UPDATE_QUEUE
+    );
+
+    thread::spawn(move || loop {
+        match publish_customer_update_event(&publish_url) {
+            Ok(status) => info!(
+                "Published '{}' event to queue '{}' via {} (HTTP {status})",
+                CUSTOMER_UPDATE_EVENT,
+                CUSTOMER_UPDATE_QUEUE,
+                publish_url
+            ),
+            Err(error) => error!(
+                "Failed to publish '{}' event to queue '{}': {error}",
+                CUSTOMER_UPDATE_EVENT,
+                CUSTOMER_UPDATE_QUEUE
+            ),
+        }
+
+        thread::sleep(Duration::from_secs(CUSTOMER_UPDATE_INTERVAL_SECS));
+    });
+}
+
+fn publish_customer_update_event(publish_url: &str) -> Result<u16, String> {
+    let payload = json!({
+        "event": CUSTOMER_UPDATE_EVENT,
+        "queue": CUSTOMER_UPDATE_QUEUE,
+        "source": SERVICE_NAME,
+    })
+    .to_string();
+
+    match ureq::post(publish_url)
+        .set("Content-Type", "application/json")
+        .send_string(&payload)
+    {
+        Ok(response) => {
+            let status = response.status();
+            let _ = response.into_string();
+            Ok(status)
+        }
+        Err(ureq::Error::Status(status, mut response)) => {
+            let _ = response.into_string();
+            Err(format!("runner responded with HTTP {status}"))
+        }
+        Err(error) => Err(error.to_string()),
     }
 }
 

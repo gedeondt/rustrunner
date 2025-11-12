@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Write};
 
 use env_logger::{Builder, Env, Target};
 use log::{error, info, warn};
@@ -14,6 +14,7 @@ struct EndpointResponse {
 
 const SERVICE_NAME: &str = "sap-debt-adapter";
 const PORT: u16 = 15003;
+const CUSTOMER_UPDATE_QUEUE_ENDPOINT: &str = "queues/cliente-actualizado";
 
 fn main() {
     Builder::from_env(Env::default().default_filter_or("info"))
@@ -36,6 +37,10 @@ fn main() {
 }
 
 fn handle_request(request: Request) -> Result<(), Box<dyn std::error::Error>> {
+    if request.method() == &Method::Post {
+        return handle_post(request);
+    }
+
     if request.method() != &Method::Get {
         warn!(
             "Rejecting request with unsupported method {:?} to {}",
@@ -143,6 +148,43 @@ fn dispatch_endpoint(segments: &[&str]) -> Option<EndpointResponse> {
         }
         _ => None,
     }
+}
+
+fn handle_post(mut request: Request) -> Result<(), Box<dyn std::error::Error>> {
+    let full_path = request.url().to_owned();
+    let path = full_path
+        .split_once('?')
+        .map(|(left, _)| left)
+        .unwrap_or(full_path.as_str())
+        .trim_start_matches('/');
+
+    if path == CUSTOMER_UPDATE_QUEUE_ENDPOINT {
+        handle_customer_update_event(request)?;
+        return Ok(());
+    }
+
+    warn!("Rejecting POST to unknown path /{}", path);
+    let response = Response::from_string("not found").with_status_code(404);
+    request.respond(response)?;
+    Ok(())
+}
+
+fn handle_customer_update_event(mut request: Request) -> Result<(), Box<dyn std::error::Error>> {
+    let mut payload = String::new();
+    if let Err(error) = request.as_reader().read_to_string(&mut payload) {
+        warn!("Failed to read customer update event payload: {}", error);
+    } else if !payload.trim().is_empty() {
+        info!("Received customer update payload: {}", payload);
+    }
+
+    error!("Error actualizanando cliente");
+
+    let mut response = Response::from_string("event processed").with_status_code(202);
+    if let Ok(header) = Header::from_bytes(b"Content-Type", b"text/plain; charset=utf-8") {
+        response = response.with_header(header);
+    }
+    request.respond(response)?;
+    Ok(())
 }
 
 fn json_response(payload: serde_json::Value) -> EndpointResponse {
