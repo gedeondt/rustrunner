@@ -87,6 +87,19 @@
           }
         }
       }
+    },
+    "/webhooks/customer-update": {
+      "get": {
+        "summary": "Publica un evento de cliente actualizado en la cola",
+        "responses": {
+          "202": {
+            "description": "El evento se envió al runner para su procesamiento."
+          },
+          "500": {
+            "description": "No se pudo publicar el evento en la cola interna."
+          }
+        }
+      }
     }
   }
 }

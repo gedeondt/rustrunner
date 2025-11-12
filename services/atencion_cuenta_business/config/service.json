@@ -2,5 +2,8 @@
   "prefix": "cuenta-cliente",
   "url": "http://127.0.0.1:15002",
   "domain": "atencion",
-  "type": "business"
+  "type": "business",
+  "schedules": [
+    { "endpoint": "webhooks/customer-update", "interval_secs": 30 }
+  ]
 }
