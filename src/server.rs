@@ -385,7 +385,7 @@ fn render_domain_sections(
 ) -> String {
     let health_snapshot = health.lock().map(|map| map.clone()).unwrap_or_default();
     let schedule_snapshot = schedules.lock().map(|map| map.clone()).unwrap_or_default();
-    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut groups: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
 
     for service in services {
         let health_info = health_snapshot
@@ -413,20 +413,55 @@ fn render_domain_sections(
             last_checked.as_str(),
             schedule_section.as_str(),
         );
-        groups.entry(service.domain.clone()).or_default().push(card);
+        groups
+            .entry(service.domain.clone())
+            .or_default()
+            .entry(service.kind.label().to_string())
+            .or_default()
+            .push(card);
     }
 
     let mut output = String::new();
 
-    for (domain, cards) in groups {
+    for (domain, categories) in groups {
+        let mut category_entries: Vec<(String, Vec<String>)> = categories.into_iter().collect();
+        let count: usize = category_entries.iter().map(|(_, cards)| cards.len()).sum();
         let domain_title = humanize_domain(&domain);
-        let count = cards.len();
         let count_label = if count == 1 {
             format!("{count} servicio en este dominio")
         } else {
             format!("{count} servicios en este dominio")
         };
-        let services_html = cards.join("");
+        let rank = |label: &str| match label {
+            "BFF" => 0,
+            "Business" => 1,
+            "Adapter" => 2,
+            _ => 3,
+        };
+
+        category_entries.sort_by(|(a, _), (b, _)| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+        let mut category_sections = String::new();
+
+        for (category, cards) in category_entries {
+            let summary_label = format!("{category} ({})", cards.len());
+            let services_html = cards.join("");
+            category_sections.push_str(&format!(
+                concat!(
+                    "<details class=\"group rounded-xl border border-slate-800 bg-slate-900/40\" open>",
+                    "  <summary class=\"flex cursor-pointer items-center justify-between gap-2 px-4 py-3 text-sm font-semibold text-slate-200 [&::-webkit-details-marker]:hidden\">",
+                    "    <span>{summary}</span>",
+                    "    <span class=\"text-slate-500 transition-transform group-open:-rotate-180\">⌄</span>",
+                    "  </summary>",
+                    "  <div class=\"px-4 pb-4\">",
+                    "    <ul class=\"mt-4 grid gap-4 lg:grid-cols-2\">{services}</ul>",
+                    "  </div>",
+                    "</details>"
+                ),
+                summary = escape_html(&summary_label),
+                services = services_html
+            ));
+        }
+
         output.push_str(&format!(
             concat!(
                 "<section class=\"rounded-2xl border border-slate-800 bg-slate-900/60 p-6 shadow-glow shadow-slate-950/30\">",
@@ -436,12 +471,12 @@ fn render_domain_sections(
                 "      <p class=\"text-sm text-slate-400\">{count_label}</p>",
                 "    </div>",
                 "  </div>",
-                "  <ul class=\"mt-6 grid gap-4 lg:grid-cols-2\">{services}</ul>",
+                "  <div class=\"mt-6 space-y-4\">{categories}</div>",
                 "</section>"
             ),
             domain = escape_html(&domain_title),
             count_label = escape_html(&count_label),
-            services = services_html
+            categories = category_sections
         ));
     }
 
