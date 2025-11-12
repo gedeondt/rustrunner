@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{Read as _, Write};
 
 use env_logger::{Builder, Env, Target};
 use log::{error, info, warn};
@@ -150,7 +150,7 @@ fn dispatch_endpoint(segments: &[&str]) -> Option<EndpointResponse> {
     }
 }
 
-fn handle_post(mut request: Request) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_post(request: Request) -> Result<(), Box<dyn std::error::Error>> {
     let full_path = request.url().to_owned();
     let path = full_path
         .split_once('?')
