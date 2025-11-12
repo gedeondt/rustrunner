@@ -4,6 +4,6 @@
   "domain": "facturacion",
   "type": "adapter",
   "listeners": [
-    { "queue": "clientes.actualizado", "path": "/queues/cliente-actualizado" }
+    { "clientes.actualizado": "/queues/cliente-actualizado" }
   ]
 }
