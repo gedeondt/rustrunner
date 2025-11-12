@@ -464,14 +464,19 @@ fn render_domain_sections(
 
         output.push_str(&format!(
             concat!(
-                "<section class=\"rounded-2xl border border-slate-800 bg-slate-900/60 p-6 shadow-glow shadow-slate-950/30\">",
-                "  <div class=\"flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between\">",
-                "    <div>",
-                "      <h2 class=\"text-2xl font-semibold text-white\">Dominio {domain}</h2>",
-                "      <p class=\"text-sm text-slate-400\">{count_label}</p>",
+                "<section class=\"rounded-2xl border border-slate-800 bg-slate-900/60 shadow-glow shadow-slate-950/30\">",
+                "  <details class=\"group\" open>",
+                "    <summary class=\"flex cursor-pointer items-center justify-between gap-4 px-6 py-5 text-left [&::-webkit-details-marker]:hidden\">",
+                "      <div>",
+                "        <h2 class=\"text-2xl font-semibold text-white\">Dominio {domain}</h2>",
+                "        <p class=\"text-sm text-slate-400\">{count_label}</p>",
+                "      </div>",
+                "      <span class=\"text-slate-500 transition-transform group-open:-rotate-180\">⌄</span>",
+                "    </summary>",
+                "    <div class=\"border-t border-slate-800/60 px-6 pb-6 pt-4\">",
+                "      <div class=\"space-y-4\">{categories}</div>",
                 "    </div>",
-                "  </div>",
-                "  <div class=\"mt-6 space-y-4\">{categories}</div>",
+                "  </details>",
                 "</section>"
             ),
             domain = escape_html(&domain_title),
