@@ -198,7 +198,7 @@ fn publish_customer_update_event(publish_url: &str) -> Result<u16, String> {
             let _ = response.into_string();
             Ok(status)
         }
-        Err(ureq::Error::Status(status, mut response)) => {
+        Err(ureq::Error::Status(status, response)) => {
             let _ = response.into_string();
             Err(format!("runner responded with HTTP {status}"))
         }
