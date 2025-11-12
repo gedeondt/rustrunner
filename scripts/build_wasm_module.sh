@@ -13,7 +13,14 @@ build_module() {
         return 1
     fi
 
-    cargo build --target "$TARGET" --release --manifest-path "$module_dir/Cargo.toml"
+    local manifest_path="$module_dir/Cargo.toml"
+
+    if [ ! -f "$manifest_path" ]; then
+        echo "Skipping module '$module_name' because manifest '$manifest_path' was not found." >&2
+        return 0
+    fi
+
+    cargo build --target "$TARGET" --release --manifest-path "$manifest_path"
 
     local wasm_path="$module_dir/target/${TARGET}/release/$module_name.wasm"
 
