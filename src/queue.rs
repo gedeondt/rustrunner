@@ -122,11 +122,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServiceKind;
     use std::collections::HashSet;
 
     fn sample_service(name: &str, url: &str) -> Service {
         Service {
             name: name.into(),
+            domain: "test".into(),
+            kind: ServiceKind::Adapter,
             prefix: name.into(),
             base_url: url.into(),
             allowed_get_endpoints: HashSet::new(),

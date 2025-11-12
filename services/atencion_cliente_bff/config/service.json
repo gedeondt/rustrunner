@@ -1,0 +1,6 @@
+{
+  "prefix": "cliente-bff",
+  "url": "http://127.0.0.1:15001",
+  "domain": "atencion",
+  "type": "bff"
+}

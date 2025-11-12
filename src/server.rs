@@ -1,15 +1,19 @@
 use anyhow::{anyhow, Result};
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::time::Instant;
 use std::time::SystemTime;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::config::Service;
+#[cfg(test)]
+use crate::config::ServiceKind;
 use crate::health::{HealthStatus, SharedHealthMap};
 use crate::logs::SharedLogMap;
 use crate::queue::{with_queue_registry, QueueSnapshot, SharedQueueRegistry};
 use crate::scheduler::{self, ScheduleState, SharedScheduleMap, ToggleError};
 use crate::stats::{record_http_status, SharedStats};
+use crate::templates;
 use serde_json::json;
 
 const ENTRY_PORT: u16 = 14000;
@@ -33,15 +37,9 @@ pub fn run_server(
     println!("Runner listening on http://{}:{}", "0.0.0.0", ENTRY_PORT);
 
     for request in server.incoming_requests() {
-        if let Err(error) = handle_request(
-            services,
-            health,
-            logs,
-            schedules,
-            stats,
-            queues,
-            request,
-        ) {
+        if let Err(error) =
+            handle_request(services, health, logs, schedules, stats, queues, request)
+        {
             eprintln!("Failed to handle request: {:#}", error);
         }
     }
@@ -304,8 +302,7 @@ fn handle_queue_publish(
         };
 
     for subscriber in &subscribers {
-        let mut call =
-            ureq::post(&subscriber.target_url).set("X-Rustrunner-Queue", queue_name);
+        let mut call = ureq::post(&subscriber.target_url).set("X-Rustrunner-Queue", queue_name);
 
         if let Some(ref ct) = content_type {
             call = call.set("Content-Type", ct);
@@ -381,16 +378,207 @@ fn handle_schedule_request(
     Ok(())
 }
 
+fn render_domain_sections(
+    services: &[Service],
+    health: &SharedHealthMap,
+    schedules: &SharedScheduleMap,
+) -> String {
+    let health_snapshot = health.lock().map(|map| map.clone()).unwrap_or_default();
+    let schedule_snapshot = schedules.lock().map(|map| map.clone()).unwrap_or_default();
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for service in services {
+        let health_info = health_snapshot
+            .get(&service.name)
+            .copied()
+            .unwrap_or_default();
+        let status_badge = render_status_badge(health_info.status);
+        let last_checked = match health_info.last_checked {
+            Some(instant) => {
+                let seconds = instant.elapsed().as_secs();
+                match seconds {
+                    0 => "Última verificación hace menos de un segundo".to_string(),
+                    1 => "Última verificación hace 1 segundo".to_string(),
+                    _ => format!("Última verificación hace {} segundos", seconds),
+                }
+            }
+            None => "Última verificación pendiente".to_string(),
+        };
+        let schedule_section =
+            build_schedule_section(&service.name, schedule_snapshot.get(&service.name));
+
+        let card = render_service_card(
+            service,
+            status_badge.as_str(),
+            last_checked.as_str(),
+            schedule_section.as_str(),
+        );
+        groups.entry(service.domain.clone()).or_default().push(card);
+    }
+
+    let mut output = String::new();
+
+    for (domain, cards) in groups {
+        let domain_title = humanize_domain(&domain);
+        let count = cards.len();
+        let count_label = if count == 1 {
+            format!("{count} servicio en este dominio")
+        } else {
+            format!("{count} servicios en este dominio")
+        };
+        let services_html = cards.join("");
+        output.push_str(&format!(
+            concat!(
+                "<section class=\"rounded-2xl border border-slate-800 bg-slate-900/60 p-6 shadow-glow shadow-slate-950/30\">",
+                "  <div class=\"flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between\">",
+                "    <div>",
+                "      <h2 class=\"text-2xl font-semibold text-white\">Dominio {domain}</h2>",
+                "      <p class=\"text-sm text-slate-400\">{count_label}</p>",
+                "    </div>",
+                "  </div>",
+                "  <ul class=\"mt-6 grid gap-4 lg:grid-cols-2\">{services}</ul>",
+                "</section>"
+            ),
+            domain = escape_html(&domain_title),
+            count_label = escape_html(&count_label),
+            services = services_html
+        ));
+    }
+
+    output
+}
+
+fn render_service_card(
+    service: &Service,
+    status_badge: &str,
+    last_checked: &str,
+    schedule_section: &str,
+) -> String {
+    let kind_label = service.kind.label();
+
+    format!(
+        concat!(
+            "<li class=\"rounded-2xl border border-slate-800 bg-slate-900/50 p-5 shadow shadow-slate-950/30\">",
+            "  <div class=\"flex flex-col gap-4\">",
+            "    <div class=\"flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between\">",
+            "      <div class=\"space-y-3\">",
+            "        <div class=\"flex flex-wrap items-center gap-3\">",
+            "          <h3 class=\"text-xl font-semibold text-white\">{name}</h3>",
+            "          <span class=\"inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-800/70 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-slate-200\">{kind}</span>",
+            "        </div>",
+            "        <div class=\"flex flex-col gap-1 text-sm text-slate-400\">",
+            "          <span>Prefijo: <code class=\"text-slate-200\">{prefix}</code></span>",
+            "          <span>Base URL: <code class=\"text-slate-200\">{base_url}</code></span>",
+            "        </div>",
+            "      </div>",
+            "      <div class=\"flex flex-col items-start gap-3 sm:items-end\">",
+            "        {status_badge}",
+            "        <div class=\"flex gap-2\">",
+            "          <button type=\"button\" class=\"icon-button inline-flex items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-2 text-sm font-medium text-slate-200 transition hover:bg-slate-900 focus:outline-none focus:ring focus:ring-slate-500/40\" data-action=\"logs\" data-service=\"{name_attr}\" title=\"Ver logs\" aria-label=\"Ver logs de {name_attr}\">📜</button>",
+            "          <button type=\"button\" class=\"icon-button inline-flex items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-2 text-sm font-medium text-slate-200 transition hover:bg-slate-900 focus:outline-none focus:ring focus:ring-slate-500/40\" data-action=\"openapi\" data-service=\"{name_attr}\" title=\"Ver OpenAPI\" aria-label=\"Ver OpenAPI de {name_attr}\">📘</button>",
+            "        </div>",
+            "      </div>",
+            "    </div>",
+            "    <p class=\"text-xs text-slate-500\">{last_checked}</p>",
+            "    {schedule_section}",
+            "  </div>",
+            "</li>"
+        ),
+        name = escape_html(&service.name),
+        name_attr = escape_html(&service.name),
+        kind = escape_html(kind_label),
+        prefix = escape_html(&service.prefix),
+        base_url = escape_html(&service.base_url),
+        status_badge = status_badge,
+        last_checked = escape_html(last_checked),
+        schedule_section = schedule_section
+    )
+}
+
+fn render_status_badge(status: HealthStatus) -> String {
+    let (label, classes) = match status {
+        HealthStatus::Healthy => (
+            "🟢 En línea",
+            "border-emerald-500/40 bg-emerald-500/10 text-emerald-200",
+        ),
+        HealthStatus::Unhealthy => (
+            "🔴 Fuera de servicio",
+            "border-rose-500/40 bg-rose-500/10 text-rose-200",
+        ),
+        HealthStatus::Unknown => (
+            "⚪️ Sin datos",
+            "border-slate-700 bg-slate-800/70 text-slate-300",
+        ),
+    };
+
+    format!(
+        "<span class=\"inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-wide {classes}\">{label}</span>",
+        classes = classes,
+        label = label,
+    )
+}
+
+fn humanize_domain(domain: &str) -> String {
+    if domain.is_empty() {
+        return String::new();
+    }
+
+    let mut words = Vec::new();
+    let mut current = String::new();
+
+    for ch in domain.chars() {
+        if ch == '_' || ch == '-' {
+            if !current.is_empty() {
+                words.push(current.clone());
+                current.clear();
+            }
+            continue;
+        }
+
+        if ch.is_uppercase() && !current.is_empty() {
+            words.push(current.clone());
+            current.clear();
+        }
+
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    if words.is_empty() {
+        return String::new();
+    }
+
+    words
+        .into_iter()
+        .map(|segment| {
+            let mut chars = segment.chars();
+            let mut label = String::new();
+            if let Some(first) = chars.next() {
+                for up in first.to_uppercase() {
+                    label.push(up);
+                }
+                label.push_str(&chars.as_str().to_lowercase());
+            }
+            label
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn render_queue_section(queues: &SharedQueueRegistry) -> String {
     let snapshot = match with_queue_registry(queues, |registry| registry.snapshot()) {
         Ok(snapshot) => snapshot,
         Err(_) => {
-            return "<p>No se pudo obtener el estado de las colas en este momento.</p>".to_string();
+            return "<p class=\"text-sm text-rose-300\">No se pudo obtener el estado de las colas en este momento.</p>".to_string();
         }
     };
 
     if snapshot.is_empty() {
-        return "<p>Aún no se han instanciado colas.</p>".to_string();
+        return "<p class=\"text-sm text-slate-400\">Aún no se han instanciado colas.</p>"
+            .to_string();
     }
 
     render_queue_table(&snapshot)
@@ -401,7 +589,13 @@ fn render_queue_table(snapshot: &[QueueSnapshot]) -> String {
 
     for queue in snapshot {
         rows.push_str(&format!(
-            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+            concat!(
+                "<tr class=\"border-b border-slate-800/60 last:border-b-0\">",
+                "  <td class=\"whitespace-nowrap px-4 py-3 font-medium text-slate-200\"><code>{}</code></td>",
+                "  <td class=\"px-4 py-3 text-right text-slate-300\">{}</td>",
+                "  <td class=\"px-4 py-3 text-right text-slate-300\">{}</td>",
+                "</tr>"
+            ),
             escape_html(&queue.name),
             queue.subscriber_count,
             queue.message_count
@@ -410,12 +604,18 @@ fn render_queue_table(snapshot: &[QueueSnapshot]) -> String {
 
     format!(
         concat!(
-            "<table>",
-            "  <thead>",
-            "    <tr><th>Cola</th><th>Suscriptores</th><th>Mensajes procesados</th></tr>",
-            "  </thead>",
-            "  <tbody>{}</tbody>",
-            "</table>"
+            "<div class=\"overflow-hidden rounded-xl border border-slate-800/80\">",
+            "  <table class=\"min-w-full divide-y divide-slate-800/80 text-sm\">",
+            "    <thead class=\"bg-slate-900/80 text-slate-300\">",
+            "      <tr>",
+            "        <th class=\"px-4 py-3 text-left font-semibold uppercase tracking-wider\">Cola</th>",
+            "        <th class=\"px-4 py-3 text-right font-semibold uppercase tracking-wider\">Suscriptores</th>",
+            "        <th class=\"px-4 py-3 text-right font-semibold uppercase tracking-wider\">Mensajes procesados</th>",
+            "      </tr>",
+            "    </thead>",
+            "    <tbody class=\"bg-slate-950/30\">{}</tbody>",
+            "  </table>",
+            "</div>"
         ),
         rows
     )
@@ -424,9 +624,9 @@ fn render_queue_table(snapshot: &[QueueSnapshot]) -> String {
 fn build_schedule_section(service_name: &str, entries: Option<&Vec<ScheduleState>>) -> String {
     let Some(entries) = entries else {
         return concat!(
-            "<div class=\"schedule-section\">",
-            "  <h4>Webhooks programados</h4>",
-            "  <p class=\"schedule-empty\">No hay webhooks programados.</p>",
+            "<div class=\"schedule-section rounded-xl border border-slate-800/80 bg-slate-950/40 p-4\">",
+            "  <h4 class=\"text-sm font-semibold uppercase tracking-wide text-slate-300\">Webhooks programados</h4>",
+            "  <p class=\"schedule-empty mt-2 text-sm text-slate-400\">No hay webhooks programados.</p>",
             "</div>"
         )
         .to_string();
@@ -434,9 +634,9 @@ fn build_schedule_section(service_name: &str, entries: Option<&Vec<ScheduleState
 
     if entries.is_empty() {
         return concat!(
-            "<div class=\"schedule-section\">",
-            "  <h4>Webhooks programados</h4>",
-            "  <p class=\"schedule-empty\">No hay webhooks programados.</p>",
+            "<div class=\"schedule-section rounded-xl border border-slate-800/80 bg-slate-950/40 p-4\">",
+            "  <h4 class=\"text-sm font-semibold uppercase tracking-wide text-slate-300\">Webhooks programados</h4>",
+            "  <p class=\"schedule-empty mt-2 text-sm text-slate-400\">No hay webhooks programados.</p>",
             "</div>"
         )
         .to_string();
@@ -469,19 +669,19 @@ fn build_schedule_section(service_name: &str, entries: Option<&Vec<ScheduleState
 
         items.push_str(&format!(
             concat!(
-                "<li class=\"schedule-item\" data-service=\"{service}\" data-index=\"{index}\">",
-                "  <div class=\"schedule-item__header\">",
-                "    <span><code>{endpoint}</code></span>",
-                "    <span class=\"schedule-item__meta\">Cada {interval}s · <span class=\"schedule-item__state\">{state_label}</span></span>",
-                "    <button type=\"button\" class=\"schedule-toggle\" data-service=\"{service}\" data-index=\"{index}\" data-paused=\"{paused}\">{button_label}</button>",
+                "<li class=\"schedule-item rounded-lg border border-slate-800/80 bg-slate-900/50 p-4\" data-service=\"{service}\" data-index=\"{index}\">",
+                "  <div class=\"schedule-item__header flex flex-wrap items-center justify-between gap-3\">",
+                "    <span class=\"font-medium text-slate-200\"><code>{endpoint}</code></span>",
+                "    <span class=\"schedule-item__meta text-sm text-slate-400\">Cada {interval}s · <span class=\"schedule-item__state font-semibold text-slate-200\">{state_label}</span></span>",
+                "    <button type=\"button\" class=\"schedule-toggle inline-flex items-center justify-center rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-slate-200 transition hover:bg-slate-900 focus:outline-none focus:ring focus:ring-slate-500/40\" data-service=\"{service}\" data-index=\"{index}\" data-paused=\"{paused}\">{button_label}</button>",
                 "  </div>",
-                "  <div class=\"schedule-item__details\">",
-                "    <small class=\"schedule-item__result\">{status_text}</small><br/>",
-                "    <small class=\"schedule-item__time\">{time_text}</small>",
+                "  <div class=\"schedule-item__details mt-3 flex flex-col gap-1 text-xs text-slate-400\">",
+                "    <span class=\"schedule-item__result\">{status_text}</span>",
+                "    <span class=\"schedule-item__time\">{time_text}</span>",
                 "  </div>",
                 "</li>"
             ),
-            service = service_name,
+            service = escape_html(service_name),
             index = index,
             endpoint = escape_html(&endpoint_display),
             interval = state.interval_secs,
@@ -495,9 +695,9 @@ fn build_schedule_section(service_name: &str, entries: Option<&Vec<ScheduleState
 
     format!(
         concat!(
-            "<div class=\"schedule-section\">",
-            "  <h4>Webhooks programados</h4>",
-            "  <ul class=\"schedule-list\">{items}</ul>",
+            "<div class=\"schedule-section rounded-xl border border-slate-800/80 bg-slate-950/40 p-4\">",
+            "  <h4 class=\"text-sm font-semibold uppercase tracking-wide text-slate-300\">Webhooks programados</h4>",
+            "  <ul class=\"schedule-list mt-3 flex flex-col gap-3\">{items}</ul>",
             "</div>"
         ),
         items = items
@@ -571,376 +771,30 @@ fn render_homepage(
     schedules: &SharedScheduleMap,
 ) -> Response<Cursor<Vec<u8>>> {
     let service_section = if services.is_empty() {
-        "<p>No hay servicios cargados actualmente.</p>".to_string()
+        concat!(
+            "<section class=\"rounded-2xl border border-slate-800 bg-slate-900/60 p-6 shadow-glow shadow-slate-950/30\">",
+            "  <p class=\"text-sm text-slate-400\">No hay servicios cargados actualmente.</p>",
+            "</section>"
+        )
+        .to_string()
     } else {
-        let mut items = String::new();
-        let health_snapshot = health.lock().map(|map| map.clone()).unwrap_or_default();
-        let schedule_snapshot = schedules.lock().map(|map| map.clone()).unwrap_or_default();
-        for service in services {
-            let health_info = health_snapshot
-                .get(&service.name)
-                .copied()
-                .unwrap_or_default();
-            let (status_label, status_class) = match health_info.status {
-                HealthStatus::Healthy => ("🟢 En línea", "status status--healthy"),
-                HealthStatus::Unhealthy => ("🔴 Fuera de servicio", "status status--unhealthy"),
-                HealthStatus::Unknown => ("⚪️ Sin datos", "status status--unknown"),
-            };
-            let last_checked = match health_info.last_checked {
-                Some(instant) => {
-                    let seconds = instant.elapsed().as_secs();
-                    match seconds {
-                        0 => "Última verificación hace menos de un segundo".to_string(),
-                        1 => "Última verificación hace 1 segundo".to_string(),
-                        _ => format!("Última verificación hace {} segundos", seconds),
-                    }
-                }
-                None => "Última verificación pendiente".to_string(),
-            };
-
-            let schedule_section =
-                build_schedule_section(&service.name, schedule_snapshot.get(&service.name));
-
-            let item = format!(
-                concat!(
-                    "<li>",
-                    "  <div class=\"service-header\">",
-                    "    <strong>{name}</strong>",
-                    "    <span class=\"service-actions\">",
-                    "      <button type=\"button\" class=\"icon-button\" data-action=\"logs\" data-service=\"{name}\" title=\"Ver logs\" aria-label=\"Ver logs de {name}\">📜</button>",
-                    "      <button type=\"button\" class=\"icon-button\" data-action=\"openapi\" data-service=\"{name}\" title=\"Ver OpenAPI\" aria-label=\"Ver OpenAPI de {name}\">📘</button>",
-                    "    </span>",
-                    "  </div>",
-                    "  <span class=\"{status_class}\">{status_label}</span><br/>",
-                    "  <span>Prefijo: <code>{prefix}</code></span><br/>",
-                    "  <span>Base URL: <code>{base_url}</code></span><br/>",
-                    "  <small>{last_checked}</small>",
-                    "  {schedule_section}",
-                    "</li>"
-                ),
-                name = service.name,
-                status_class = status_class,
-                status_label = status_label,
-                prefix = service.prefix,
-                base_url = service.base_url,
-                last_checked = last_checked,
-                schedule_section = schedule_section
-            );
-
-            items.push_str(&item);
-        }
-
-        format!("<ul class=\"service-list\">{}</ul>", items)
+        render_domain_sections(services, health, schedules)
     };
 
     let queue_section = render_queue_section(queues);
 
-    let html = format!(
-        concat!(
-            "<!DOCTYPE html>\n",
-            "<html lang=\"es\">\n",
-            "<head>\n",
-            "    <meta charset=\"utf-8\" />\n",
-            "    <title>Servicios disponibles</title>\n",
-            "    <link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/water.css@2/out/water.css\" />\n",
-            "    <style>\n",
-            "      .service-list {{ list-style: none; padding: 0; }}\n",
-            "      .service-list li {{ margin-bottom: 1.5rem; }}\n",
-            "      .service-header {{ display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }}\n",
-            "      .service-actions {{ display: inline-flex; align-items: center; gap: 0.25rem; }}\n",
-            "      .icon-button {{ border: none; background: none; cursor: pointer; font-size: 1.25rem; line-height: 1; padding: 0.1rem; }}\n",
-            "      .icon-button:focus {{ outline: 2px solid #4a90e2; outline-offset: 2px; }}\n",
-            "      .status {{ font-weight: bold; display: inline-block; margin-bottom: 0.25rem; }}\n",
-            "      .status--healthy {{ color: #0a7d24; }}\n",
-            "      .status--unhealthy {{ color: #c62828; }}\n",
-            "      .status--unknown {{ color: #616161; }}\n",
-            "      .schedule-section {{ margin-top: 0.75rem; padding: 0.75rem; background-color: rgba(74, 144, 226, 0.08); border-radius: 6px; }}\n",
-            "      .schedule-section h4 {{ margin: 0 0 0.5rem 0; font-size: 1rem; }}\n",
-            "      .schedule-empty {{ margin: 0; font-style: italic; color: #355a7a; }}\n",
-            "      .schedule-list {{ list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.5rem; }}\n",
-            "      .schedule-item {{ border: 1px solid rgba(74, 144, 226, 0.25); border-radius: 6px; padding: 0.6rem 0.75rem; background-color: rgba(255, 255, 255, 0.75); }}\n",
-            "      .schedule-item__header {{ display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; justify-content: space-between; }}\n",
-            "      .schedule-item__meta {{ font-size: 0.9rem; color: #1a4971; }}\n",
-            "      .schedule-item__state {{ font-weight: 600; }}\n",
-            "      .schedule-item__details {{ margin-top: 0.35rem; display: flex; flex-direction: column; gap: 0.2rem; }}\n",
-            "      .schedule-item__result {{ color: #333333; }}\n",
-            "      .schedule-item__time {{ color: #555555; }}\n",
-            "      .schedule-toggle {{ border: none; background-color: #1a73e8; color: #ffffff; padding: 0.3rem 0.75rem; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }}\n",
-            "      .schedule-toggle[data-paused='true'] {{ background-color: #2e7d32; }}\n",
-            "      .schedule-toggle:disabled {{ opacity: 0.6; cursor: progress; }}\n",
-            "      .dashboard-actions {{ display: flex; justify-content: flex-end; gap: 0.5rem; margin-bottom: 1rem; }}\n",
-            "      .modal {{ position: fixed; inset: 0; background-color: rgba(0, 0, 0, 0.4); display: flex; align-items: center; justify-content: center; padding: 1rem; z-index: 1000; }}\n",
-            "      .modal[hidden] {{ display: none; }}\n",
-            "      .modal__dialog {{ background: #ffffff; color: #000000; width: min(90vw, 720px); max-height: 80vh; border-radius: 8px; box-shadow: 0 20px 45px rgba(0, 0, 0, 0.2); display: flex; flex-direction: column; overflow: hidden; }}\n",
-            "      .modal__header {{ display: flex; align-items: center; justify-content: space-between; padding: 0.75rem 1rem; border-bottom: 1px solid #e0e0e0; }}\n",
-            "      .modal__title {{ margin: 0; font-size: 1.1rem; }}\n",
-            "      .modal__close {{ border: none; background: none; font-size: 1.5rem; line-height: 1; cursor: pointer; }}\n",
-            "      .modal__body {{ padding: 1rem; overflow: auto; }}\n",
-            "      .modal__body pre {{ margin: 0; font-size: 0.9rem; white-space: pre-wrap; word-break: break-word; }}\n",
-            "      .stats-empty {{ text-align: center; color: #616161; margin: 1rem 0; }}\n",
-            "      .stats-modal__canvas {{ width: 100%; }}\n",
-            "    </style>\n",
-            "    <script src=\"https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js\"></script>\n",
-            "</head>\n",
-            "<body>\n",
-            "    <main>\n",
-            "      <h1>Servicios disponibles</h1>\n",
-            "      <div class=\"dashboard-actions\">\n",
-            "        <button type=\"button\" id=\"stats-button\" class=\"icon-button\" title=\"Ver estadísticas\" aria-label=\"Ver estadísticas\">📈</button>\n",
-            "      </div>\n",
-            "        <p>Estos son los servicios registrados actualmente en el runner.</p>\n",
-            "        {}\n",
-            "      <h2>Colas internas</h2>\n",
-            "        {}\n",
-            "    </main>\n",
-            "    <div id=\"modal\" class=\"modal\" hidden>\n",
-            "      <div class=\"modal__dialog\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"modal-title\">\n",
-            "        <div class=\"modal__header\">\n",
-            "          <h2 id=\"modal-title\" class=\"modal__title\"></h2>\n",
-            "          <button type=\"button\" class=\"modal__close\" aria-label=\"Cerrar\">✖</button>\n",
-            "        </div>\n",
-            "        <div class=\"modal__body\">\n",
-            "          <pre id=\"modal-content\"></pre>\n",
-            "        </div>\n",
-            "      </div>\n",
-            "    </div>\n",
-            "    <div id=\"stats-modal\" class=\"modal\" hidden>\n",
-            "      <div class=\"modal__dialog\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"stats-modal-title\">\n",
-            "        <div class=\"modal__header\">\n",
-            "          <h2 id=\"stats-modal-title\" class=\"modal__title\">Estadísticas de respuestas</h2>\n",
-            "          <button type=\"button\" class=\"modal__close\" aria-label=\"Cerrar\">✖</button>\n",
-            "        </div>\n",
-            "        <div class=\"modal__body\">\n",
-            "          <p id=\"stats-empty\" class=\"stats-empty\" hidden>Sin datos disponibles todavía.</p>\n",
-            "          <canvas id=\"stats-chart\" class=\"stats-modal__canvas\" width=\"600\" height=\"320\" hidden></canvas>\n",
-            "        </div>\n",
-            "      </div>\n",
-            "    </div>\n",
-            "    <script>\n",
-            "      (function() {{\n",
-            "        const modal = document.getElementById('modal');\n",
-            "        const titleEl = document.getElementById('modal-title');\n",
-            "        const contentEl = document.getElementById('modal-content');\n",
-            "        const closeBtn = modal.querySelector('.modal__close');\n",
-            "        const ACTION_LABELS = {{ logs: 'Logs', openapi: 'OpenAPI' }};\n",
-
-            "        function closeModal() {{\n",
-            "          modal.setAttribute('hidden', 'hidden');\n",
-            "          contentEl.textContent = '';\n",
-            "        }}\n",
-
-            "        async function openModal(action, service) {{\n",
-            "          const label = ACTION_LABELS[action] || 'Detalles';\n",
-            "          titleEl.textContent = label + ' — ' + service;\n",
-            "          contentEl.textContent = 'Cargando...';\n",
-            "          modal.removeAttribute('hidden');\n",
-
-            "          try {{\n",
-            "            const response = await fetch('/__runner__/services/' + encodeURIComponent(service) + '/' + action);\n",
-            "            if (!response.ok) {{\n",
-            "              const text = await response.text();\n",
-            "              throw new Error(text || ('Error ' + response.status));\n",
-            "            }}\n",
-            "            let text = await response.text();\n",
-            "            if (action === 'openapi' && text) {{\n",
-            "              try {{\n",
-            "                const parsed = JSON.parse(text);\n",
-            "                text = JSON.stringify(parsed, null, 2);\n",
-            "              }} catch (_) {{\n",
-            "                // dejar el texto tal cual\n",
-            "              }}\n",
-            "            }}\n",
-            "            contentEl.textContent = text || 'Sin contenido disponible.';\n",
-            "          }} catch (error) {{\n",
-            "            contentEl.textContent = 'Error al cargar: ' + error.message;\n",
-            "          }}\n",
-            "        }}\n",
-
-            "        document.querySelectorAll('.icon-button[data-action][data-service]').forEach((button) => {{\n",
-            "          button.addEventListener('click', () => {{\n",
-            "            const action = button.getAttribute('data-action');\n",
-            "            const service = button.getAttribute('data-service');\n",
-            "            if (action && service) {{\n",
-            "              openModal(action, service);\n",
-            "            }}\n",
-            "          }});\n",
-            "        }});\n",
-            "\n",
-            "        document.querySelectorAll('.schedule-item__result').forEach((resultEl) => {{\n",
-            "          if (!resultEl.dataset.originalText) {{\n",
-            "            resultEl.dataset.originalText = resultEl.textContent || '';\n",
-            "          }}\n",
-            "        }});\n",
-            "\n",
-            "        document.querySelectorAll('.schedule-toggle').forEach((button) => {{\n",
-            "          button.addEventListener('click', async () => {{\n",
-            "            const service = button.getAttribute('data-service');\n",
-            "            const index = button.getAttribute('data-index');\n",
-            "            if (!service || index === null) {{\n",
-            "              return;\n",
-            "            }}\n",
-            "            const item = button.closest('.schedule-item');\n",
-            "            const stateEl = item ? item.querySelector('.schedule-item__state') : null;\n",
-            "            const resultEl = item ? item.querySelector('.schedule-item__result') : null;\n",
-            "            if (resultEl && !resultEl.dataset.originalText) {{\n",
-            "              resultEl.dataset.originalText = resultEl.textContent || '';\n",
-            "            }}\n",
-            "            button.disabled = true;\n",
-            "            try {{\n",
-            "              const response = await fetch('/__runner__/services/' + encodeURIComponent(service) + '/schedules/' + index + '/toggle');\n",
-            "              if (!response.ok) {{\n",
-            "                const text = await response.text();\n",
-            "                throw new Error(text || ('Error ' + response.status));\n",
-            "              }}\n",
-            "              const payload = await response.json();\n",
-            "              const paused = Boolean(payload.paused);\n",
-            "              button.dataset.paused = paused ? 'true' : 'false';\n",
-            "              button.textContent = paused ? 'Reanudar' : 'Pausar';\n",
-            "              if (stateEl) {{\n",
-            "                stateEl.textContent = paused ? '⏸️ Pausado' : '▶️ En ejecución';\n",
-            "              }}\n",
-            "              if (resultEl) {{\n",
-            "                const baseText = resultEl.dataset.originalText || '';\n",
-            "                resultEl.textContent = baseText + ' · Estado: ' + (paused ? 'pausado' : 'en ejecución');\n",
-            "              }}\n",
-            "            }} catch (error) {{\n",
-            "              if (resultEl) {{\n",
-            "                resultEl.textContent = 'Error al actualizar: ' + error.message;\n",
-            "              }}\n",
-            "            }} finally {{\n",
-            "              button.disabled = false;\n",
-            "            }}\n",
-            "          }});\n",
-            "        }});\n",
-            "\n",
-
-            "        closeBtn.addEventListener('click', closeModal);\n",
-            "        modal.addEventListener('click', (event) => {{\n",
-            "          if (event.target === modal) {{\n",
-            "            closeModal();\n",
-            "          }}\n",
-            "        }});\n",
-            "        document.addEventListener('keydown', (event) => {{\n",
-            "          if (event.key === 'Escape' && !modal.hasAttribute('hidden')) {{\n",
-            "            closeModal();\n",
-            "          }}\n",
-            "        }});\n",
-            "      }})();\n",
-            "      (function() {{\n",
-            "        const statsButton = document.getElementById('stats-button');\n",
-            "        const statsModal = document.getElementById('stats-modal');\n",
-            "        if (!statsButton || !statsModal) {{\n",
-            "          return;\n",
-            "        }}\n",
-            "        const closeBtn = statsModal.querySelector('.modal__close');\n",
-            "        const emptyState = document.getElementById('stats-empty');\n",
-            "        const chartCanvas = document.getElementById('stats-chart');\n",
-            "        let chartInstance = null;\n",
-
-            "        function closeStatsModal() {{\n",
-            "          statsModal.setAttribute('hidden', 'hidden');\n",
-            "        }}\n",
-
-            "        function showMessage(message) {{\n",
-            "          emptyState.textContent = message;\n",
-            "          emptyState.removeAttribute('hidden');\n",
-            "          chartCanvas.setAttribute('hidden', 'hidden');\n",
-            "        }}\n",
-
-            "        function renderChart(labels, datasets) {{\n",
-            "          emptyState.setAttribute('hidden', 'hidden');\n",
-            "          chartCanvas.removeAttribute('hidden');\n",
-            "          if (chartInstance) {{\n",
-            "            chartInstance.destroy();\n",
-            "          }}\n",
-            "          chartInstance = new Chart(chartCanvas, {{\n",
-            "            type: 'line',\n",
-            "            data: {{ labels, datasets }},\n",
-            "            options: {{\n",
-            "              responsive: true,\n",
-            "              maintainAspectRatio: false,\n",
-            "              scales: {{\n",
-            "                y: {{ beginAtZero: true, ticks: {{ precision: 0 }} }}\n",
-            "              }}\n",
-            "            }}\n",
-            "          }});\n",
-            "        }}\n",
-
-            "        async function openStatsModal() {{\n",
-            "          statsModal.removeAttribute('hidden');\n",
-            "          showMessage('Cargando estadísticas...');\n",
-            "          try {{\n",
-            "            const response = await fetch('/__runner__/stats');\n",
-            "            if (!response.ok) {{\n",
-            "              const text = await response.text();\n",
-            "              throw new Error(text || ('Error ' + response.status));\n",
-            "            }}\n",
-            "            const payload = await response.json();\n",
-            "            const minutes = Array.isArray(payload.global) ? payload.global : [];\n",
-            "            if (!minutes.length) {{\n",
-            "              showMessage('Sin datos disponibles todavía.');\n",
-            "              return;\n",
-            "            }}\n",
-            "            const codes = new Set();\n",
-            "            minutes.forEach((entry) => {{\n",
-            "              if (entry && entry.counts) {{\n",
-            "                Object.keys(entry.counts).forEach((code) => codes.add(code));\n",
-            "              }}\n",
-            "            }});\n",
-            "            const sortedCodes = Array.from(codes).sort();\n",
-            "            const labels = minutes.map((entry) => {{\n",
-            "              const minute = Number(entry.minute || 0);\n",
-            "              const date = new Date(minute * 60000);\n",
-            "              return date.toISOString().substring(11, 16);\n",
-            "            }});\n",
-            "            const palette = ['#1976d2', '#388e3c', '#f57c00', '#c2185b', '#7b1fa2', '#0097a7', '#455a64'];\n",
-            "            const datasets = sortedCodes.map((code, index) => {{\n",
-            "              const color = palette[index % palette.length];\n",
-            "              return {{\n",
-            "                label: 'HTTP ' + code,\n",
-            "                data: minutes.map((entry) => {{\n",
-            "                  const counts = entry && entry.counts ? entry.counts : {{}};\n",
-            "                  const value = counts[code];\n",
-            "                  return typeof value === 'number' ? value : Number(value || 0);\n",
-            "                }}),\n",
-            "                borderColor: color,\n",
-            "                backgroundColor: color,\n",
-            "                tension: 0.25,\n",
-            "                fill: false,\n",
-            "              }};\n",
-            "            }});\n",
-            "            renderChart(labels, datasets);\n",
-            "          }} catch (error) {{\n",
-            "            showMessage('Error al cargar estadísticas: ' + error.message);\n",
-            "          }}\n",
-            "        }}\n",
-
-            "        statsButton.addEventListener('click', openStatsModal);\n",
-            "        closeBtn.addEventListener('click', closeStatsModal);\n",
-            "        statsModal.addEventListener('click', (event) => {{\n",
-            "          if (event.target === statsModal) {{\n",
-            "            closeStatsModal();\n",
-            "          }}\n",
-            "        }});\n",
-            "        document.addEventListener('keydown', (event) => {{\n",
-            "          if (event.key === 'Escape' && !statsModal.hasAttribute('hidden')) {{\n",
-            "            closeStatsModal();\n",
-            "          }}\n",
-            "        }});\n",
-            "      }})();\n",
-            "    </script>\n",
-            "</body>\n",
-            "</html>\n"
-        ),
-        service_section,
-        queue_section
+    let html = templates::render(
+        templates::DASHBOARD,
+        &[
+            ("service_section", service_section.as_str()),
+            ("queue_section", queue_section.as_str()),
+        ],
     );
 
     let mut response = Response::from_string(html);
     if let Ok(header) = Header::from_bytes(b"Content-Type", b"text/html; charset=utf-8") {
         response = response.with_header(header);
     }
-
     response
 }
 
@@ -952,6 +806,8 @@ mod tests {
     fn resolve_service_route_matches_prefix() {
         let service = Service {
             name: "svc".into(),
+            domain: "demo".into(),
+            kind: ServiceKind::Business,
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
             allowed_get_endpoints: Default::default(),
@@ -971,6 +827,8 @@ mod tests {
     fn resolve_service_route_ignores_empty_endpoint() {
         let service = Service {
             name: "svc".into(),
+            domain: "demo".into(),
+            kind: ServiceKind::Adapter,
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
             allowed_get_endpoints: Default::default(),

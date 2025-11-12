@@ -6,8 +6,9 @@ mod queue;
 mod scheduler;
 mod server;
 mod stats;
+mod templates;
 
-pub use config::{load_services, Service};
+pub use config::{load_services, Service, ServiceKind};
 pub use health::{HealthStatus, ServiceHealth, SharedHealthMap};
 pub use logs::{initialize_log_store, SharedLogMap};
 pub use process::start_service_processes;
@@ -27,12 +28,5 @@ pub fn run() -> Result<()> {
     let stats = stats::initialize_stats_store();
     let queues = queue::initialize_queue_registry(&services);
 
-    server::run_server(
-        &services,
-        &health,
-        &logs,
-        &schedules,
-        &stats,
-        &queues,
-    )
+    server::run_server(&services, &health, &logs, &schedules, &stats, &queues)
 }

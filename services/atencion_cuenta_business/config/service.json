@@ -1,0 +1,6 @@
+{
+  "prefix": "cuenta-cliente",
+  "url": "http://127.0.0.1:15002",
+  "domain": "atencion",
+  "type": "business"
+}

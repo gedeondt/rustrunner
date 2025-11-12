@@ -11,6 +11,8 @@ use tiny_http::Method;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Service {
     pub name: String,
+    pub domain: String,
+    pub kind: ServiceKind,
     pub prefix: String,
     pub base_url: String,
     pub allowed_get_endpoints: HashSet<String>,
@@ -36,10 +38,31 @@ pub struct ServiceQueueListener {
     pub path: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceKind {
+    Bff,
+    Business,
+    Adapter,
+}
+
+impl ServiceKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ServiceKind::Bff => "BFF",
+            ServiceKind::Business => "Business",
+            ServiceKind::Adapter => "Adapter",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct RawServiceConfig {
     prefix: String,
     url: String,
+    domain: String,
+    #[serde(rename = "type")]
+    kind: ServiceKind,
     #[serde(default)]
     listeners: Vec<HashMap<String, String>>,
     #[serde(default)]
@@ -117,6 +140,8 @@ pub fn load_services() -> Result<Vec<Service>> {
         let RawServiceConfig {
             prefix,
             url,
+            domain,
+            kind,
             listeners,
             schedules: raw_schedules,
         } = read_service_config(&name)?;
@@ -128,6 +153,8 @@ pub fn load_services() -> Result<Vec<Service>> {
 
         services.push(Service {
             name,
+            domain,
+            kind,
             prefix,
             base_url: url,
             allowed_get_endpoints,
@@ -185,6 +212,10 @@ fn validate_service_config(name: &str, config: &RawServiceConfig) -> Result<()> 
 
     if config.url.trim().is_empty() {
         bail!("url for service '{}' cannot be empty", name);
+    }
+
+    if config.domain.trim().is_empty() {
+        bail!("domain for service '{}' cannot be empty", name);
     }
 
     Ok(())
@@ -423,6 +454,8 @@ mod tests {
     fn supports_only_known_get_endpoints() {
         let service = Service {
             name: "example".into(),
+            domain: "demo".into(),
+            kind: ServiceKind::Business,
             prefix: "foo".into(),
             base_url: "http://localhost".into(),
             allowed_get_endpoints: ["ping".into()].into_iter().collect(),
