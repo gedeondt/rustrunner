@@ -26,7 +26,7 @@ services/
 * **Compilación WebAssembly**: antes de ejecutar el runner es necesario compilar cada servicio a
   WebAssembly (WASI Preview 1). Puedes compilar todos los servicios de una sola vez con
   `./scripts/build_wasm_module.sh` o solo uno pasando su nombre como argumento. El runner carga el
-  archivo `.wasm` generado en `services/<nombre>/target/wasm32-wasi/release/` y lo ejecuta con
+  archivo `.wasm` generado en `services/<nombre>/target/wasm32-wasip1/release/` y lo ejecuta con
   Wasmtime.
 
 ## Servicios incluidos

@@ -12,7 +12,7 @@ use wasmtime_wasi::{HostOutputStream, StdoutStream, StreamResult, Subscribe, Was
 use crate::config::Service;
 use crate::logs::{record_log_line, SharedLogMap};
 
-const WASM_TARGET: &str = "wasm32-wasi";
+const WASM_TARGET: &str = "wasm32-wasip1";
 const WASM_PROFILE: &str = "release";
 
 fn module_directory(module_name: &str) -> PathBuf {
