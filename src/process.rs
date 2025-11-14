@@ -1,326 +1,72 @@
-use std::fs;
-use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use toml::Value;
+use anyhow::{anyhow, Context, Result};
+use wasmtime::{Engine, Linker, Module, Store};
+use wasmtime_wasi::preview1::{self, WasiP1Ctx};
+use wasmtime_wasi::WasiCtxBuilder;
 
-use crate::config::{service_manifest_path, Service};
-use crate::logs::{spawn_log_forwarder, SharedLogMap};
+const WASM_TARGET: &str = "wasm32-wasip2";
+const WASM_PROFILE: &str = "release";
 
-const SERVICE_STARTUP_ATTEMPTS: usize = 50;
-const SERVICE_STARTUP_BACKOFF_MS: u64 = 100;
-
-fn build_service(manifest_path: &Path, service_name: &str) -> Result<()> {
-    let status = Command::new("cargo")
-        .arg("build")
-        .arg("--manifest-path")
-        .arg(manifest_path)
-        .status()
-        .with_context(|| format!("failed to build service '{}' via cargo", service_name))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        bail!("cargo build failed for service '{}'", service_name);
-    }
+fn module_directory(module_name: &str) -> PathBuf {
+    Path::new("services")
+        .join(module_name)
+        .join("target")
+        .join(WASM_TARGET)
+        .join(WASM_PROFILE)
 }
 
-fn service_binary_path(manifest_path: &Path) -> Result<PathBuf> {
-    let service_dir = manifest_path.parent().ok_or_else(|| {
-        anyhow!(
-            "service manifest '{}' does not have a parent directory",
-            manifest_path.display()
-        )
-    })?;
+fn module_path(module_name: &str) -> Result<PathBuf> {
+    let wasm_path = module_directory(module_name).join(format!("{module_name}.wasm"));
 
-    let package_name = package_name_from_manifest(manifest_path)?;
-
-    #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut relative_path = PathBuf::from("target").join("debug").join(package_name);
-
-    #[cfg(windows)]
-    {
-        relative_path.set_extension("exe");
-    }
-
-    let candidate = service_dir.join(&relative_path);
-
-    if !candidate.exists() {
-        bail!(
-            "compiled binary for manifest '{}' was not found at {}",
-            manifest_path.display(),
-            candidate.display()
-        );
-    }
-
-    let binary_path = candidate.canonicalize().with_context(|| {
-        format!(
-            "failed to canonicalize binary path for manifest '{}'",
-            manifest_path.display()
-        )
-    })?;
-
-    Ok(binary_path)
-}
-
-fn package_name_from_manifest(manifest_path: &Path) -> Result<String> {
-    let contents = fs::read_to_string(manifest_path).with_context(|| {
-        format!(
-            "failed to read service manifest at {}",
-            manifest_path.display()
-        )
-    })?;
-
-    let document: Value = toml::from_str(&contents).with_context(|| {
-        format!(
-            "failed to parse service manifest at {}",
-            manifest_path.display()
-        )
-    })?;
-
-    let package = document
-        .get("package")
-        .and_then(Value::as_table)
-        .ok_or_else(|| {
-            anyhow!(
-                "service manifest at '{}' is missing the [package] section",
-                manifest_path.display()
-            )
-        })?;
-
-    let name = package.get("name").and_then(Value::as_str).ok_or_else(|| {
-        anyhow!(
-            "service manifest at '{}' is missing package.name",
-            manifest_path.display()
-        )
-    })?;
-
-    Ok(name.to_owned())
-}
-
-pub struct ServiceGuard {
-    name: String,
-    child: Child,
-}
-
-impl Drop for ServiceGuard {
-    fn drop(&mut self) {
-        use std::io::ErrorKind;
-
-        match self.child.try_wait() {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                if let Err(error) = self.child.kill() {
-                    if error.kind() != ErrorKind::InvalidInput {
-                        eprintln!("failed to stop service '{}': {}", self.name, error);
-                    }
-                }
-
-                if let Err(error) = self.child.wait() {
-                    if error.kind() != ErrorKind::InvalidInput {
-                        eprintln!("failed to wait for service '{}': {}", self.name, error);
-                    }
-                }
-            }
-            Err(error) => {
-                eprintln!(
-                    "failed to determine status of service '{}': {}",
-                    self.name, error
-                );
-            }
-        }
-    }
-}
-
-pub fn start_service_processes(
-    services: &[Service],
-    logs: &SharedLogMap,
-) -> Result<Vec<ServiceGuard>> {
-    let mut guards = Vec::new();
-
-    for service in services {
-        if probe_service(service).is_ok() {
-            println!(
-                "Service '{}' already running at {}",
-                service.name, service.base_url
-            );
-            continue;
-        }
-
-        let manifest_path = service_manifest_path(&service.name);
-        println!(
-            "Starting service '{}' using manifest {}",
-            service.name,
-            manifest_path.display()
-        );
-
-        build_service(&manifest_path, &service.name)?;
-
-        let binary_path = service_binary_path(&manifest_path).with_context(|| {
-            format!(
-                "failed to resolve executable for service '{}'",
-                service.name
-            )
-        })?;
-
-        let service_dir = manifest_path.parent().ok_or_else(|| {
-            anyhow!(
-                "service manifest '{}' does not have a parent directory",
-                manifest_path.display()
-            )
-        })?;
-
-        let mut command = Command::new(&binary_path);
-        command
-            .current_dir(service_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = command.spawn().with_context(|| {
-            format!(
-                "failed to start service '{}' using binary {}",
-                service.name,
-                binary_path.display()
-            )
-        })?;
-
-        if let Some(stdout) = child.stdout.take() {
-            spawn_log_forwarder(service.name.clone(), stdout, "stdout", Arc::clone(logs));
-        }
-
-        if let Some(stderr) = child.stderr.take() {
-            spawn_log_forwarder(service.name.clone(), stderr, "stderr", Arc::clone(logs));
-        }
-
-        match wait_for_service(service) {
-            Ok(()) => {
-                guards.push(ServiceGuard {
-                    name: service.name.clone(),
-                    child,
-                });
-            }
-            Err(error) => {
-                use std::io::ErrorKind;
-
-                if let Err(kill_error) = child.kill() {
-                    if kill_error.kind() != ErrorKind::InvalidInput {
-                        eprintln!(
-                            "failed to stop service '{}' after startup error: {}",
-                            service.name, kill_error
-                        );
-                    }
-                }
-                let _ = child.wait();
-                return Err(error);
-            }
-        }
-    }
-
-    Ok(guards)
-}
-
-fn wait_for_service(service: &Service) -> Result<()> {
-    let mut last_error = None;
-
-    for _ in 0..SERVICE_STARTUP_ATTEMPTS {
-        match probe_service(service) {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                last_error = Some(error);
-                thread::sleep(Duration::from_millis(SERVICE_STARTUP_BACKOFF_MS));
-            }
-        }
-    }
-
-    if let Some(error) = last_error {
-        return Err(error).context(format!(
-            "service '{}' did not become ready in time",
-            service.name
+    if !wasm_path.exists() {
+        return Err(anyhow!(
+            "WebAssembly module '{}' was not found at {}",
+            module_name,
+            wasm_path.display()
         ));
     }
 
-    bail!("service '{}' did not become ready in time", service.name)
+    wasm_path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize module path for '{}'", module_name))
 }
 
-fn probe_service(service: &Service) -> Result<()> {
-    use std::net::TcpStream;
+pub fn run_module(module_name: &str) -> Result<()> {
+    let wasm_path = module_path(module_name)?;
 
-    let url = url::Url::parse(&service.base_url).with_context(|| {
+    let engine = Engine::default();
+    let module = Module::from_file(&engine, &wasm_path).with_context(|| {
         format!(
-            "invalid base URL '{}' for service '{}'",
-            service.base_url, service.name
+            "failed to load module '{}': {}",
+            module_name,
+            wasm_path.display()
         )
     })?;
 
-    let host = url.host_str().ok_or_else(|| {
-        anyhow!(
-            "service '{}' base URL missing host: {}",
-            service.name,
-            service.base_url
-        )
-    })?;
+    let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
+    preview1::add_to_linker_sync(&mut linker, |ctx: &mut WasiP1Ctx| ctx)
+        .context("failed to configure WASI imports")?;
 
-    let port = url.port_or_known_default().ok_or_else(|| {
-        anyhow!(
-            "service '{}' base URL missing port: {}",
-            service.name,
-            service.base_url
-        )
-    })?;
-
-    let mut last_error = None;
-
-    for address in (host, port).to_socket_addrs().with_context(|| {
+    let precompiled = linker.instantiate_pre(&module).with_context(|| {
         format!(
-            "failed to resolve address for service '{}' at {}",
-            service.name, service.base_url
+            "failed to prepare module '{}' for instantiation",
+            module_name
         )
-    })? {
-        match TcpStream::connect_timeout(&address, Duration::from_millis(200)) {
-            Ok(_) => return Ok(()),
-            Err(error) => last_error = Some(error),
-        }
-    }
+    })?;
 
-    if let Some(error) = last_error {
-        let context = format!(
-            "failed to connect to service '{}' at {}",
-            service.name, service.base_url
-        );
-        return Err(anyhow!(error)).context(context);
-    }
+    let wasi_ctx = WasiCtxBuilder::new().inherit_stdio().build_p1();
+    let mut store = Store::new(&engine, wasi_ctx);
 
-    bail!(
-        "service '{}' resolved to no addresses at {}",
-        service.name,
-        service.base_url
-    )
-}
+    let instance = precompiled
+        .instantiate(&mut store)
+        .with_context(|| format!("failed to instantiate module '{}'", module_name))?;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::ServiceKind;
+    let start = instance
+        .get_typed_func::<(), ()>(&mut store, "_start")
+        .context("module is missing the '_start' entrypoint")?;
 
-    #[test]
-    fn manifest_path_uses_service_name() {
-        let service = Service {
-            name: "svc".into(),
-            domain: "demo".into(),
-            kind: ServiceKind::Business,
-            prefix: "svc".into(),
-            base_url: "http://localhost:1234".into(),
-            allowed_get_endpoints: Default::default(),
-            queue_listeners: Vec::new(),
-            schedules: Vec::new(),
-        };
-
-        let path = crate::config::service_manifest_path(&service.name);
-        assert!(path.ends_with("svc/Cargo.toml"));
-    }
+    start
+        .call(&mut store, ())
+        .with_context(|| format!("module '{}' exited with an error", module_name))
 }
