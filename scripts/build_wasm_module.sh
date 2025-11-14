@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TARGET="wasm32-wasip2"
+TARGET="wasm32-wasip1"
 SCRIPT_DIR="$(dirname "$0")"
 
 build_module() {

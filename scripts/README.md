@@ -16,7 +16,7 @@ Ejecuta el script desde la raíz del repositorio:
 
 ## `check_wasm_toolchain.sh`
 
-* Comprueba que el objetivo `wasm32-wasip2` esté instalado en `rustup`.
+* Comprueba que el objetivo `wasm32-wasip1` esté instalado en `rustup`.
 * Verifica que `cargo` esté disponible antes de construir los servicios como WebAssembly.
 
 Úsalo cuando configures el entorno por primera vez:
@@ -27,7 +27,7 @@ Ejecuta el script desde la raíz del repositorio:
 
 ## `build_wasm_module.sh`
 
-* Ejecuta el script de la carpeta `services/` que compila cada servicio hacia `wasm32-wasip2` en
+* Ejecuta el script de la carpeta `services/` que compila cada servicio hacia `wasm32-wasip1` en
   modo `release`.
 * Acepta un nombre de servicio para compilar uno en concreto o se encarga de todos si no se le
   pasa argumento.
