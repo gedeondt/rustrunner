@@ -1,4 +1,6 @@
-use std::io::{Read as _, Write};
+use std::io::{Read, Write};
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use env_logger::{Builder, Env, Target};
 use log::{error, info, warn};
@@ -22,7 +24,8 @@ fn main() {
         .target(Target::Stdout)
         .init();
 
-    let server = Server::http(("0.0.0.0", PORT)).expect("failed to bind facturación sap adapter service");
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT);
+    let server = Server::http(bind_addr).expect("failed to bind facturación sap adapter service");
     info!(
         "Service '{SERVICE_NAME}' listening on http://{}:{}",
         "0.0.0.0",
@@ -171,7 +174,8 @@ fn handle_post(request: Request) -> Result<(), Box<dyn std::error::Error>> {
 
 fn handle_customer_update_event(mut request: Request) -> Result<(), Box<dyn std::error::Error>> {
     let mut payload = String::new();
-    if let Err(error) = request.as_reader().read_to_string(&mut payload) {
+    let mut reader = request.as_reader();
+    if let Err(error) = Read::read_to_string(&mut reader, &mut payload) {
         warn!("Failed to read customer update event payload: {}", error);
     } else if !payload.trim().is_empty() {
         info!("Received customer update payload: {}", payload);

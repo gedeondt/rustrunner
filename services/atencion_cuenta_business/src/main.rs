@@ -1,6 +1,8 @@
 use std::env;
 use std::io::Write;
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
 use env_logger::{Builder, Env, Target};
 use log::{error, info, warn};
 use serde_json::json;
@@ -25,7 +27,8 @@ fn main() {
         .target(Target::Stdout)
         .init();
 
-    let server = Server::http(("0.0.0.0", PORT)).expect("failed to bind atención cuenta business service");
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT);
+    let server = Server::http(bind_addr).expect("failed to bind atención cuenta business service");
     info!(
         "Service '{SERVICE_NAME}' listening on http://{}:{}",
         "0.0.0.0",
