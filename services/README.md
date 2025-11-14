@@ -23,8 +23,11 @@ services/
 * **Documentación OpenAPI**: cada servicio debe incluir un `openapi.json` sencillo con la lista de
   rutas que ofrece. El runner valida cada petición entrante contra esta definición antes de
   reenviarla al servicio correspondiente.
-* **Ejecución local**: cada servicio puede iniciarse de forma independiente con `cargo run` desde
-  su carpeta, aunque el runner se encarga de hacerlo automáticamente cuando está disponible.
+* **Compilación WebAssembly**: antes de ejecutar el runner es necesario compilar cada servicio a
+  WebAssembly (WASI Preview 2). Puedes compilar todos los servicios de una sola vez con
+  `./scripts/build_wasm_module.sh` o solo uno pasando su nombre como argumento. El runner carga el
+  archivo `.wasm` generado en `services/<nombre>/target/wasm32-wasip2/release/` y lo ejecuta con
+  Wasmtime.
 
 ## Servicios incluidos
 

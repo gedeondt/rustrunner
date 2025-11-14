@@ -1,9 +1,16 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
+use bytes::Bytes;
 use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
-use wasmtime_wasi::WasiCtxBuilder;
+use wasmtime_wasi::{HostOutputStream, StdoutStream, StreamResult, Subscribe, WasiCtxBuilder};
+
+use crate::config::Service;
+use crate::logs::{record_log_line, SharedLogMap};
 
 const WASM_TARGET: &str = "wasm32-wasip2";
 const WASM_PROFILE: &str = "release";
@@ -33,6 +40,46 @@ fn module_path(module_name: &str) -> Result<PathBuf> {
 }
 
 pub fn run_module(module_name: &str) -> Result<()> {
+    run_module_with_streams(module_name, None, None)
+}
+
+pub struct ServiceModuleHandle {
+    _join: JoinHandle<()>,
+}
+
+pub fn start_service_modules(
+    services: &[Service],
+    logs: &SharedLogMap,
+) -> Result<Vec<ServiceModuleHandle>> {
+    let mut handles = Vec::new();
+
+    for service in services {
+        let stdout_stream = LogStream::new(&service.name, "stdout", logs);
+        let stderr_stream = LogStream::new(&service.name, "stderr", logs);
+        let module_name = service.name.clone();
+
+        let handle = thread::Builder::new()
+            .name(format!("svc-{}", module_name))
+            .spawn(move || {
+                if let Err(error) =
+                    run_module_with_streams(&module_name, Some(stdout_stream), Some(stderr_stream))
+                {
+                    eprintln!("service '{module_name}' exited with error: {error:?}");
+                }
+            })
+            .with_context(|| format!("failed to spawn thread for service '{}'", service.name))?;
+
+        handles.push(ServiceModuleHandle { _join: handle });
+    }
+
+    Ok(handles)
+}
+
+fn run_module_with_streams(
+    module_name: &str,
+    stdout_stream: Option<LogStream>,
+    stderr_stream: Option<LogStream>,
+) -> Result<()> {
     let wasm_path = module_path(module_name)?;
 
     let engine = Engine::default();
@@ -55,7 +102,27 @@ pub fn run_module(module_name: &str) -> Result<()> {
         )
     })?;
 
-    let wasi_ctx = WasiCtxBuilder::new().inherit_stdio().build_p1();
+    let mut wasi_ctx_builder = WasiCtxBuilder::new();
+
+    match stdout_stream {
+        Some(stream) => {
+            wasi_ctx_builder.stdout(stream);
+        }
+        None => {
+            wasi_ctx_builder.inherit_stdout();
+        }
+    }
+
+    match stderr_stream {
+        Some(stream) => {
+            wasi_ctx_builder.stderr(stream);
+        }
+        None => {
+            wasi_ctx_builder.inherit_stderr();
+        }
+    }
+
+    let wasi_ctx = wasi_ctx_builder.build_p1();
     let mut store = Store::new(&engine, wasi_ctx);
 
     let instance = precompiled
@@ -69,4 +136,95 @@ pub fn run_module(module_name: &str) -> Result<()> {
     start
         .call(&mut store, ())
         .with_context(|| format!("module '{}' exited with an error", module_name))
+}
+
+#[derive(Clone)]
+struct LogStream {
+    inner: Arc<LogStreamInner>,
+}
+
+impl LogStream {
+    fn new(service_name: &str, stream_label: &'static str, logs: &SharedLogMap) -> Self {
+        LogStream {
+            inner: Arc::new(LogStreamInner {
+                service_name: service_name.to_string(),
+                stream_label,
+                logs: Arc::clone(logs),
+                buffer: Mutex::new(String::new()),
+            }),
+        }
+    }
+}
+
+impl StdoutStream for LogStream {
+    fn stream(&self) -> Box<dyn HostOutputStream> {
+        Box::new(LogWriteStream {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+
+    fn isatty(&self) -> bool {
+        false
+    }
+}
+
+struct LogStreamInner {
+    service_name: String,
+    stream_label: &'static str,
+    logs: SharedLogMap,
+    buffer: Mutex<String>,
+}
+
+impl LogStreamInner {
+    fn write_bytes(&self, chunk: &[u8]) {
+        let mut buffer = self.buffer.lock().unwrap();
+        buffer.push_str(&String::from_utf8_lossy(chunk));
+
+        while let Some(pos) = buffer.find('\n') {
+            let line: String = buffer.drain(..=pos).collect();
+            self.emit_line(line);
+        }
+    }
+
+    fn flush(&self) {
+        let mut buffer = self.buffer.lock().unwrap();
+        if buffer.is_empty() {
+            return;
+        }
+        let line: String = buffer.drain(..).collect();
+        drop(buffer);
+        self.emit_line(line);
+    }
+
+    fn emit_line(&self, mut line: String) {
+        while line.ends_with('\n') || line.ends_with('\r') {
+            line.pop();
+        }
+        record_log_line(&self.service_name, &line, self.stream_label, &self.logs);
+    }
+}
+
+struct LogWriteStream {
+    inner: Arc<LogStreamInner>,
+}
+
+#[async_trait]
+impl Subscribe for LogWriteStream {
+    async fn ready(&mut self) {}
+}
+
+impl HostOutputStream for LogWriteStream {
+    fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
+        self.inner.write_bytes(bytes.as_ref());
+        Ok(())
+    }
+
+    fn flush(&mut self) -> StreamResult<()> {
+        self.inner.flush();
+        Ok(())
+    }
+
+    fn check_write(&mut self) -> StreamResult<usize> {
+        Ok(usize::MAX / 2)
+    }
 }

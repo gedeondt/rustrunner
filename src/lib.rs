@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use health::start_health_monitor;
 use logs::spawn_log_forwarder;
+use process::start_service_modules;
 
 enum Invocation {
     Runner,
@@ -62,9 +63,10 @@ fn detect_invocation() -> Result<Invocation> {
 fn run_high_level_runner() -> Result<()> {
     let services = load_services()?;
 
-    let health = start_health_monitor(&services);
     let logs = initialize_log_store(&services);
     seed_log_store(&services, &logs);
+    let _service_modules = start_service_modules(&services, &logs)?;
+    let health = start_health_monitor(&services);
     let schedules = start_webhook_schedulers(&services);
     let stats = initialize_stats_store();
     let queues = initialize_queue_registry(&services);

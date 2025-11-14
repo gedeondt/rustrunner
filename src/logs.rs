@@ -33,20 +33,7 @@ pub fn spawn_log_forwarder<R>(
         let buffered = BufReader::new(reader);
         for line in buffered.lines() {
             match line {
-                Ok(line) => {
-                    let (level, message) = parse_service_log_line(&line)
-                        .map(|(level, message)| (level.to_string(), message.to_string()))
-                        .unwrap_or_else(|| (stream_label.to_uppercase(), line));
-                    let formatted = format!("[svc:{}][{}] {}", service_name, level, message);
-                    println!("{}", formatted);
-                    if let Ok(mut guard) = logs.lock() {
-                        let entry = guard.entry(service_name.clone()).or_default();
-                        entry.push_back(formatted);
-                        while entry.len() > MAX_STORED_LOG_LINES {
-                            entry.pop_front();
-                        }
-                    }
-                }
+                Ok(line) => record_log_line(&service_name, &line, stream_label, &logs),
                 Err(error) => {
                     eprintln!(
                         "failed to read {stream_label} from service '{}': {}",
@@ -57,6 +44,22 @@ pub fn spawn_log_forwarder<R>(
             }
         }
     });
+}
+
+pub fn record_log_line(service_name: &str, line: &str, stream_label: &str, logs: &SharedLogMap) {
+    let sanitized = line.trim_end_matches('\r');
+    let (level, message) = parse_service_log_line(sanitized)
+        .map(|(level, message)| (level.to_string(), message.to_string()))
+        .unwrap_or_else(|| (stream_label.to_uppercase(), sanitized.to_string()));
+    let formatted = format!("[svc:{}][{}] {}", service_name, level, message);
+    println!("{}", formatted);
+    if let Ok(mut guard) = logs.lock() {
+        let entry = guard.entry(service_name.to_string()).or_default();
+        entry.push_back(formatted);
+        while entry.len() > MAX_STORED_LOG_LINES {
+            entry.pop_front();
+        }
+    }
 }
 
 pub fn parse_service_log_line(line: &str) -> Option<(&str, &str)> {
