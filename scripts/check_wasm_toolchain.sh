@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TARGET="wasm32-wasip2"
+TARGET="wasm32-wasi"
 
 if ! command -v rustup >/dev/null 2>&1; then
     echo "rustup is required to manage Rust targets." >&2

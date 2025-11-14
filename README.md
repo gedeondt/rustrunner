@@ -4,7 +4,7 @@
 
 Este repositorio contiene un "runner" escrito en Rust que inicia servicios HTTP de ejemplo,
 los enruta mediante un punto de entrada único y expone un panel web con el estado de cada
-servicio. Cada servicio se distribuye como un módulo WebAssembly (WASI Preview 2) que el
+servicio. Cada servicio se distribuye como un módulo WebAssembly (WASI Preview 1) que el
 runner carga y ejecuta usando Wasmtime, por lo que es necesario compilar dichos módulos
 antes de arrancar el proceso principal. También se incluyen utilidades para verificar el
 entorno de desarrollo requerido.
