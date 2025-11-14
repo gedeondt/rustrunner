@@ -4,7 +4,10 @@
 
 Este repositorio contiene un "runner" escrito en Rust que inicia servicios HTTP de ejemplo,
 los enruta mediante un punto de entrada único y expone un panel web con el estado de cada
-servicio. También incluye utilidades para verificar el entorno de desarrollo requerido.
+servicio. Cada servicio se distribuye como un módulo WebAssembly (WASI Preview 2) que el
+runner carga y ejecuta usando Wasmtime, por lo que es necesario compilar dichos módulos
+antes de arrancar el proceso principal. También se incluyen utilidades para verificar el
+entorno de desarrollo requerido.
 
 ## Requisitos previos
 
@@ -22,19 +25,26 @@ necesario.
 
 ## Puesta en marcha
 
-1. Compila y ejecuta el runner principal:
+1. Compila los servicios a WebAssembly (se debe repetir cuando cambies código dentro de
+   `services/`):
+
+   ```bash
+   ./scripts/build_wasm_module.sh
+   ```
+
+2. Compila y ejecuta el runner principal:
 
    ```bash
    cargo run
    ```
 
-2. El runner levantará automáticamente los servicios que encuentre en la carpeta `services/` y
-   quedará escuchando en `http://127.0.0.1:14000`.
+3. El runner levantará automáticamente los módulos que encuentre en la carpeta `services/`
+   y quedará escuchando en `http://127.0.0.1:14000`.
 
-3. Abre la URL anterior en el navegador para ver el panel de resumen, donde se listan los
+4. Abre la URL anterior en el navegador para ver el panel de resumen, donde se listan los
    servicios disponibles, su prefijo y el resultado del último sondeo de salud.
 
-4. Cada servicio expone sus propios endpoints bajo su puerto correspondiente y un endpoint
+5. Cada servicio expone sus propios endpoints bajo su puerto correspondiente y un endpoint
    `GET /health` que responde con `200 OK`. El runner consulta este endpoint cada cinco segundos
    para actualizar el estado mostrado en el panel.
 
