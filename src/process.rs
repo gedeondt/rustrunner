@@ -103,6 +103,8 @@ fn run_module_with_streams(
     })?;
 
     let mut wasi_ctx_builder = WasiCtxBuilder::new();
+    wasi_ctx_builder.inherit_network();
+    wasi_ctx_builder.allow_ip_name_lookup(true);
 
     match stdout_stream {
         Some(stream) => {
