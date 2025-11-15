@@ -10,6 +10,7 @@ use crate::config::Service;
 use crate::config::ServiceKind;
 use crate::health::{HealthStatus, SharedHealthMap};
 use crate::logs::SharedLogMap;
+use crate::memory::{ServiceMemorySnapshot, SharedMemoryMap};
 use crate::queue::{with_queue_registry, QueueSnapshot, SharedQueueRegistry};
 use crate::scheduler::{self, ScheduleState, SharedScheduleMap, ToggleError};
 use crate::stats::{record_http_status, SharedStats};
@@ -25,6 +26,7 @@ pub fn run_server(
     schedules: &SharedScheduleMap,
     stats: &SharedStats,
     queues: &SharedQueueRegistry,
+    memory: &SharedMemoryMap,
 ) -> Result<()> {
     let server = Server::http(("0.0.0.0", ENTRY_PORT)).map_err(|error| {
         anyhow!(
@@ -37,9 +39,9 @@ pub fn run_server(
     println!("Runner listening on http://{}:{}", "0.0.0.0", ENTRY_PORT);
 
     for request in server.incoming_requests() {
-        if let Err(error) =
-            handle_request(services, health, logs, schedules, stats, queues, request)
-        {
+        if let Err(error) = handle_request(
+            services, health, logs, schedules, stats, queues, memory, request,
+        ) {
             eprintln!("Failed to handle request: {:#}", error);
         }
     }
@@ -54,6 +56,7 @@ fn handle_request(
     schedules: &SharedScheduleMap,
     stats: &SharedStats,
     queues: &SharedQueueRegistry,
+    memory: &SharedMemoryMap,
     request: Request,
 ) -> Result<()> {
     let full_path = request.url().to_owned();
@@ -87,7 +90,7 @@ fn handle_request(
     }
 
     if trimmed_path.is_empty() {
-        let response = render_homepage(services, health, queues, schedules);
+        let response = render_homepage(services, health, queues, schedules, memory);
         request.respond(response)?;
         return Ok(());
     }
@@ -382,9 +385,11 @@ fn render_domain_sections(
     services: &[Service],
     health: &SharedHealthMap,
     schedules: &SharedScheduleMap,
+    memory: &SharedMemoryMap,
 ) -> String {
     let health_snapshot = health.lock().map(|map| map.clone()).unwrap_or_default();
     let schedule_snapshot = schedules.lock().map(|map| map.clone()).unwrap_or_default();
+    let memory_snapshot = memory.lock().map(|map| map.clone()).unwrap_or_default();
     let mut groups: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
 
     for service in services {
@@ -406,11 +411,17 @@ fn render_domain_sections(
         };
         let schedule_section =
             build_schedule_section(&service.name, schedule_snapshot.get(&service.name));
+        let memory_info = memory_snapshot
+            .get(&service.name)
+            .copied()
+            .unwrap_or_default();
+        let memory_section = render_memory_section(&memory_info);
 
         let card = render_service_card(
             service,
             status_badge.as_str(),
             last_checked.as_str(),
+            memory_section.as_str(),
             schedule_section.as_str(),
         );
         groups
@@ -492,6 +503,7 @@ fn render_service_card(
     service: &Service,
     status_badge: &str,
     last_checked: &str,
+    memory_section: &str,
     schedule_section: &str,
 ) -> String {
     let kind_label = service.kind.label();
@@ -520,6 +532,7 @@ fn render_service_card(
             "      </div>",
             "    </div>",
             "    <p class=\"text-xs text-slate-500\">{last_checked}</p>",
+            "    {memory_section}",
             "    {schedule_section}",
             "  </div>",
             "</li>"
@@ -531,6 +544,7 @@ fn render_service_card(
         base_url = escape_html(&service.base_url),
         status_badge = status_badge,
         last_checked = escape_html(last_checked),
+        memory_section = memory_section,
         schedule_section = schedule_section
     )
 }
@@ -744,12 +758,84 @@ fn build_schedule_section(service_name: &str, entries: Option<&Vec<ScheduleState
     )
 }
 
+fn render_memory_section(snapshot: &ServiceMemorySnapshot) -> String {
+    let description = match (snapshot.usage_bytes, snapshot.limit_bytes) {
+        (Some(usage), Some(limit)) if limit > 0 => {
+            let percent = ((usage as f64) / (limit as f64)).min(1.0) * 100.0;
+            format!(
+                "{} / {} ({percent:.0}%)",
+                format_bytes(usage),
+                format_bytes(limit)
+            )
+        }
+        (Some(usage), _) => format!("{} en uso", format_bytes(usage)),
+        (None, Some(limit)) => format!("Límite configurado: {}", format_bytes(limit)),
+        (None, None) => "Sin datos de consumo".to_string(),
+    };
+
+    let progress = match (snapshot.usage_bytes, snapshot.limit_bytes) {
+        (Some(usage), Some(limit)) if limit > 0 => {
+            let percent = ((usage as f64) / (limit as f64)).min(1.0) * 100.0;
+            format!(
+                concat!(
+                    "<div class=\"mt-2 h-2 w-full rounded-full bg-slate-800/80\">",
+                    "  <div class=\"h-full rounded-full bg-emerald-400\" style=\"width: {percent:.0}%\"></div>",
+                    "</div>",
+                    "<p class=\"mt-1 text-right text-xs text-slate-500\">{percent:.0}% del límite</p>"
+                ),
+                percent = percent
+            )
+        }
+        _ => String::new(),
+    };
+
+    let updated = snapshot.last_updated.map(|instant| {
+        let text = describe_elapsed("Actualizado", instant);
+        format!(
+            "<p class=\"mt-1 text-xs text-slate-500\">{}</p>",
+            escape_html(&text)
+        )
+    });
+
+    format!(
+        concat!(
+            "<div class=\"rounded-2xl border border-slate-800/80 bg-slate-950/40 p-4\">",
+            "  <p class=\"text-xs font-semibold uppercase tracking-wide text-slate-400\">Memoria</p>",
+            "  <p class=\"mt-1 text-sm text-slate-200\">{description}</p>",
+            "  {progress}",
+            "  {updated}",
+            "</div>"
+        ),
+        description = escape_html(&description),
+        progress = progress,
+        updated = updated.unwrap_or_default()
+    )
+}
+
 fn describe_elapsed(prefix: &str, instant: Instant) -> String {
     let seconds = instant.elapsed().as_secs();
     match seconds {
         0 => format!("{prefix} hace menos de un segundo"),
         1 => format!("{prefix} hace 1 segundo"),
         _ => format!("{prefix} hace {seconds} segundos"),
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    let value = bytes as f64;
+
+    if bytes >= GB as u64 {
+        format!("{:.1} GB", value / GB)
+    } else if bytes >= MB as u64 {
+        format!("{:.1} MB", value / MB)
+    } else if bytes >= KB as u64 {
+        format!("{:.1} KB", value / KB)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -809,6 +895,7 @@ fn render_homepage(
     health: &SharedHealthMap,
     queues: &SharedQueueRegistry,
     schedules: &SharedScheduleMap,
+    memory: &SharedMemoryMap,
 ) -> Response<Cursor<Vec<u8>>> {
     let service_section = if services.is_empty() {
         concat!(
@@ -818,7 +905,7 @@ fn render_homepage(
         )
         .to_string()
     } else {
-        render_domain_sections(services, health, schedules)
+        render_domain_sections(services, health, schedules, memory)
     };
 
     let queue_section = render_queue_section(queues);
@@ -853,6 +940,7 @@ mod tests {
             allowed_get_endpoints: Default::default(),
             queue_listeners: Vec::new(),
             schedules: Vec::new(),
+            memory_limit_mb: None,
         };
         let services = vec![service];
 
@@ -874,6 +962,7 @@ mod tests {
             allowed_get_endpoints: Default::default(),
             queue_listeners: Vec::new(),
             schedules: Vec::new(),
+            memory_limit_mb: None,
         };
         let services = vec![service];
 

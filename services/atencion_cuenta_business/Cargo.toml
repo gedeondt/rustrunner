@@ -6,13 +6,7 @@ edition = "2021"
 [dependencies]
 bytes = "1"
 env_logger = "0.11"
-hyper_wasi = { version = "0.15", features = ["http1", "server", "runtime"] }
+hyper = { package = "hyper_wasi", version = "0.15", features = ["http1", "server", "runtime", "client"] }
 log = "0.4"
 serde_json = "1"
 tokio = { package = "tokio_wasi", version = "1", features = ["macros", "rt", "net", "io-util", "time"] }
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ureq = { version = "2", default-features = false, features = ["native-tls"] }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-ureq = { version = "2", default-features = false }

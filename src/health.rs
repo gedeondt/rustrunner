@@ -103,6 +103,7 @@ mod tests {
             allowed_get_endpoints: Default::default(),
             queue_listeners: Vec::new(),
             schedules: Vec::new(),
+            memory_limit_mb: None,
         };
 
         assert_eq!(healthcheck_url(&service), "http://localhost:1234/health");
@@ -119,6 +120,7 @@ mod tests {
             allowed_get_endpoints: Default::default(),
             queue_listeners: Vec::new(),
             schedules: Vec::new(),
+            memory_limit_mb: None,
         };
 
         let health = start_health_monitor(&[service.clone()]);

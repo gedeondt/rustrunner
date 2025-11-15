@@ -3,6 +3,7 @@
   "url": "http://127.0.0.1:15002",
   "domain": "atencion",
   "type": "business",
+  "memory_limit_mb": 96,
   "schedules": [
     { "endpoint": "webhooks/customer-update", "interval_secs": 30 }
   ]

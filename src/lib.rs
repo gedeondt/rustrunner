@@ -1,6 +1,7 @@
 mod config;
 mod health;
 mod logs;
+mod memory;
 mod process;
 mod queue;
 mod scheduler;
@@ -11,6 +12,7 @@ mod templates;
 pub use config::{load_services, Service, ServiceKind};
 pub use health::{HealthStatus, ServiceHealth, SharedHealthMap};
 pub use logs::{initialize_log_store, SharedLogMap};
+pub use memory::{initialize_memory_store, SharedMemoryMap};
 pub use process::run_module;
 pub use queue::{initialize_queue_registry, SharedQueueRegistry};
 pub use scheduler::{start_webhook_schedulers, SharedScheduleMap};
@@ -65,13 +67,16 @@ fn run_high_level_runner() -> Result<()> {
 
     let logs = initialize_log_store(&services);
     seed_log_store(&services, &logs);
-    let _service_modules = start_service_modules(&services, &logs)?;
+    let memory = initialize_memory_store(&services);
+    let _service_modules = start_service_modules(&services, &logs, &memory)?;
     let health = start_health_monitor(&services);
     let schedules = start_webhook_schedulers(&services);
     let stats = initialize_stats_store();
     let queues = initialize_queue_registry(&services);
 
-    run_server(&services, &health, &logs, &schedules, &stats, &queues)
+    run_server(
+        &services, &health, &logs, &schedules, &stats, &queues, &memory,
+    )
 }
 
 fn seed_log_store(services: &[Service], logs: &SharedLogMap) {

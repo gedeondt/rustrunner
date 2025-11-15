@@ -1,13 +1,14 @@
 use std::convert::Infallible;
 use std::env;
 use std::io::Write;
-
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use env_logger::{Builder, Env, Target};
+use hyper::body;
+use hyper::client::HttpConnector;
 use hyper::header::{HeaderValue, CONTENT_TYPE};
 use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use hyper::{Body, Client, Method, Request, Response, Server, StatusCode};
 use log::{error, info, warn};
 use serde_json::json;
 
@@ -68,7 +69,7 @@ async fn handle_request(request: Request<Body>) -> Result<EndpointResult, Infall
         .filter(|segment| !segment.is_empty())
         .collect();
 
-    let Some(result) = dispatch_endpoint(&segments) else {
+    let Some(result) = dispatch_endpoint(&segments).await else {
         return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
     };
 
@@ -98,7 +99,7 @@ fn text_response(status: StatusCode, body: &str) -> EndpointResult {
     response
 }
 
-fn dispatch_endpoint(segments: &[&str]) -> Option<EndpointResponse> {
+async fn dispatch_endpoint(segments: &[&str]) -> Option<EndpointResponse> {
     match segments {
         ["health"] => Some(EndpointResponse {
             status: 200,
@@ -158,7 +159,7 @@ fn dispatch_endpoint(segments: &[&str]) -> Option<EndpointResponse> {
             });
             Some(json_response(payload))
         }
-        ["webhooks", "customer-update"] => Some(trigger_customer_update_webhook()),
+        ["webhooks", "customer-update"] => Some(trigger_customer_update_webhook().await),
         _ => None,
     }
 }
@@ -171,10 +172,11 @@ fn json_response(payload: serde_json::Value) -> EndpointResponse {
     }
 }
 
-fn trigger_customer_update_webhook() -> EndpointResponse {
+async fn trigger_customer_update_webhook() -> EndpointResponse {
     let publish_url = build_runner_publish_url();
+    let client = Client::new();
 
-    match publish_customer_update_event(&publish_url) {
+    match publish_customer_update_event(&client, &publish_url).await {
         Ok(status) => {
             info!(
                 "Published '{}' event to queue '{}' via {} (HTTP {status})",
@@ -223,7 +225,10 @@ fn build_runner_publish_url() -> String {
     )
 }
 
-fn publish_customer_update_event(publish_url: &str) -> Result<u16, String> {
+async fn publish_customer_update_event(
+    client: &Client<HttpConnector>,
+    publish_url: &str,
+) -> Result<u16, String> {
     let payload = json!({
         "event": CUSTOMER_UPDATE_EVENT,
         "queue": CUSTOMER_UPDATE_QUEUE,
@@ -231,20 +236,25 @@ fn publish_customer_update_event(publish_url: &str) -> Result<u16, String> {
     })
     .to_string();
 
-    match ureq::post(publish_url)
-        .set("Content-Type", "application/json")
-        .send_string(&payload)
-    {
-        Ok(response) => {
-            let status = response.status();
-            let _ = response.into_string();
-            Ok(status)
-        }
-        Err(ureq::Error::Status(status, response)) => {
-            let _ = response.into_string();
-            Err(format!("runner responded with HTTP {status}"))
-        }
-        Err(error) => Err(error.to_string()),
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(publish_url)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(payload))
+        .map_err(|error| error.to_string())?;
+
+    let response = client
+        .request(request)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let status = response.status();
+    let _ = body::to_bytes(response.into_body()).await;
+
+    if status.is_success() {
+        Ok(status.as_u16())
+    } else {
+        Err(format!("runner responded with HTTP {}", status.as_u16()))
     }
 }
 
@@ -252,17 +262,17 @@ fn publish_customer_update_event(publish_url: &str) -> Result<u16, String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn dispatch_endpoint_returns_account() {
-        let response = dispatch_endpoint(&["accounts", "ES123" ]).expect("account endpoint");
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_endpoint_returns_account() {
+        let response = dispatch_endpoint(&["accounts", "ES123" ]).await.expect("account endpoint");
         assert_eq!(response.status, 200);
         assert_eq!(response.content_type, "application/json");
         assert!(response.body.contains("\"accountId\":\"ES123\""));
     }
 
-    #[test]
-    fn dispatch_endpoint_returns_health() {
-        let response = dispatch_endpoint(&["health"]).expect("health endpoint");
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_endpoint_returns_health() {
+        let response = dispatch_endpoint(&["health"]).await.expect("health endpoint");
         assert_eq!(response.status, 200);
         assert_eq!(response.body, "ok");
     }

@@ -8,6 +8,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use tiny_http::Method;
 
+const MAX_MEMORY_LIMIT_MB: u64 = (u32::MAX as u64) / 16;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Service {
     pub name: String,
@@ -18,6 +20,7 @@ pub struct Service {
     pub allowed_get_endpoints: HashSet<String>,
     pub queue_listeners: Vec<ServiceQueueListener>,
     pub schedules: Vec<ServiceSchedule>,
+    pub memory_limit_mb: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +32,12 @@ pub struct ServiceSchedule {
 impl Service {
     pub fn supports(&self, method: &Method, endpoint: &str) -> bool {
         matches!(method, &Method::Get) && self.allowed_get_endpoints.contains(endpoint)
+    }
+
+    pub fn memory_page_limit(&self) -> Option<u32> {
+        self.memory_limit_mb
+            .and_then(|limit| limit.checked_mul(16))
+            .and_then(|pages| pages.try_into().ok())
     }
 }
 
@@ -63,6 +72,8 @@ struct RawServiceConfig {
     domain: String,
     #[serde(rename = "type")]
     kind: ServiceKind,
+    #[serde(default)]
+    memory_limit_mb: Option<u64>,
     #[serde(default)]
     listeners: Vec<HashMap<String, String>>,
     #[serde(default)]
@@ -153,6 +164,7 @@ pub fn load_services() -> Result<Vec<Service>> {
             url,
             domain,
             kind,
+            memory_limit_mb,
             listeners,
             schedules: raw_schedules,
         } = read_service_config(&name)?;
@@ -171,6 +183,7 @@ pub fn load_services() -> Result<Vec<Service>> {
             allowed_get_endpoints,
             queue_listeners,
             schedules,
+            memory_limit_mb,
         });
     }
 
@@ -227,6 +240,18 @@ fn validate_service_config(name: &str, config: &RawServiceConfig) -> Result<()> 
 
     if config.domain.trim().is_empty() {
         bail!("domain for service '{}' cannot be empty", name);
+    }
+
+    if let Some(limit) = config.memory_limit_mb {
+        if limit == 0 {
+            bail!("memory_limit_mb for service '{name}' must be greater than zero");
+        }
+
+        if limit > MAX_MEMORY_LIMIT_MB {
+            bail!(
+                "memory_limit_mb for service '{name}' exceeds supported maximum of {MAX_MEMORY_LIMIT_MB} MB"
+            );
+        }
     }
 
     Ok(())
@@ -458,7 +483,7 @@ fn collect_get_endpoints(document: &Value) -> Result<HashSet<String>> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use tiny_http::Method;
 
     #[test]
@@ -472,11 +497,32 @@ mod tests {
             allowed_get_endpoints: ["ping".into()].into_iter().collect(),
             queue_listeners: Vec::new(),
             schedules: Vec::new(),
+            memory_limit_mb: None,
         };
 
         assert!(service.supports(&Method::Get, "ping"));
         assert!(!service.supports(&Method::Post, "ping"));
         assert!(!service.supports(&Method::Get, "pong"));
+    }
+
+    #[test]
+    fn converts_memory_limit_to_pages() {
+        let mut service = Service {
+            name: "example".into(),
+            domain: "demo".into(),
+            kind: ServiceKind::Business,
+            prefix: "foo".into(),
+            base_url: "http://localhost".into(),
+            allowed_get_endpoints: HashSet::new(),
+            queue_listeners: Vec::new(),
+            schedules: Vec::new(),
+            memory_limit_mb: Some(100),
+        };
+
+        assert_eq!(service.memory_page_limit(), Some(1600));
+
+        service.memory_limit_mb = None;
+        assert_eq!(service.memory_page_limit(), None);
     }
 
     #[test]

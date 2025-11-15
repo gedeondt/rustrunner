@@ -3,6 +3,19 @@ set -euo pipefail
 
 TARGET="wasm32-wasip1"
 SCRIPT_DIR="$(dirname "$0")"
+DEFAULT_WASI_SDK="$HOME/.wasmedge/wasi-sdk-24.0"
+
+configure_wasi_sdk() {
+    local wasi_sdk="${WASI_SDK_PATH:-$DEFAULT_WASI_SDK}"
+
+    if [ -d "$wasi_sdk" ]; then
+        export WASI_SDK_PATH="$wasi_sdk"
+        export CC_wasm32_wasip1="$wasi_sdk/bin/clang"
+        export AR_wasm32_wasip1="$wasi_sdk/bin/llvm-ar"
+    else
+        echo "Warning: WASI SDK not found at '$wasi_sdk'. Install it or set WASI_SDK_PATH." >&2
+    fi
+}
 
 build_module() {
     local module_name="$1"
@@ -38,6 +51,7 @@ build_module() {
 }
 
 "$SCRIPT_DIR/check_wasm_toolchain.sh"
+configure_wasi_sdk
 
 if [ $# -eq 0 ]; then
     shopt -s nullglob

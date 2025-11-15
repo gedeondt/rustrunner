@@ -135,6 +135,7 @@ mod tests {
             allowed_get_endpoints: HashSet::new(),
             queue_listeners: Vec::new(),
             schedules: Vec::new(),
+            memory_limit_mb: None,
         }
     }
 

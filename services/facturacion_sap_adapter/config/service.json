@@ -3,6 +3,7 @@
   "url": "http://127.0.0.1:15003",
   "domain": "facturacion",
   "type": "adapter",
+  "memory_limit_mb": 80,
   "listeners": [
     { "clientes.actualizado": "/queues/cliente-actualizado" }
   ]

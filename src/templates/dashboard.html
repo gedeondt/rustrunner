@@ -2,7 +2,7 @@
 <html lang="es">
 <head>
   <meta charset="utf-8" />
-  <title>Servicios disponibles</title>
+  <title>WasmRunner</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -24,10 +24,15 @@
 </head>
 <body class="bg-night-900 text-slate-100 min-h-screen">
   <main class="mx-auto flex max-w-6xl flex-col gap-8 px-4 py-10">
-    <header class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-      <div class="space-y-2">
-        <h1 class="text-3xl font-semibold tracking-tight text-white">Servicios disponibles</h1>
-        <p class="text-sm text-slate-400">Estos son los servicios registrados actualmente en el runner.</p>
+    <header class="flex flex-col gap-6 rounded-2xl border border-slate-800/60 bg-slate-900/60 p-6 shadow-glow shadow-slate-950/20 sm:flex-row sm:items-center sm:justify-between">
+      <div class="space-y-4">
+        <div class="flex items-center gap-4">
+          <div class="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-400 to-cyan-500 text-xl font-bold text-night-900 shadow-lg shadow-emerald-500/30">WR</div>
+          <div>
+            <p class="text-sm font-medium uppercase tracking-[0.4em] text-emerald-100/70">WasmRunner</p>
+            <h1 class="text-3xl font-semibold tracking-tight text-white">Servicios disponibles</h1>
+          </div>
+        </div>
       </div>
       <div class="flex items-center gap-3">
         <button
