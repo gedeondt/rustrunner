@@ -1,12 +1,15 @@
+use std::convert::Infallible;
 use std::env;
 use std::io::Write;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use env_logger::{Builder, Env, Target};
+use hyper::header::{HeaderValue, CONTENT_TYPE};
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use log::{error, info, warn};
 use serde_json::json;
-use tiny_http::{Header, Method, Request, Response, Server};
 
 #[derive(Debug, PartialEq, Eq)]
 struct EndpointResponse {
@@ -21,63 +24,78 @@ const DEFAULT_RUNNER_BASE_URL: &str = "http://127.0.0.1:14000";
 const CUSTOMER_UPDATE_QUEUE: &str = "clientes.actualizado";
 const CUSTOMER_UPDATE_EVENT: &str = "ClienteActualizado";
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     Builder::from_env(Env::default().default_filter_or("info"))
         .format(|buf, record| writeln!(buf, "[{}] {}", record.level(), record.args()))
         .target(Target::Stdout)
         .init();
 
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT);
-    let server = Server::http(bind_addr).expect("failed to bind atención cuenta business service");
     info!(
         "Service '{SERVICE_NAME}' listening on http://{}:{}",
         "0.0.0.0",
         PORT
     );
 
-    for request in server.incoming_requests() {
-        if let Err(error) = handle_request(request) {
-            error!("failed to handle request: {error}");
-        }
+    if let Err(error) = run_http_server(bind_addr).await {
+        error!("HTTP server exited with error: {error}");
     }
 }
 
-fn handle_request(request: Request) -> Result<(), Box<dyn std::error::Error>> {
-    if request.method() != &Method::Get {
+async fn run_http_server(bind_addr: SocketAddr) -> Result<(), hyper::Error> {
+    let make_service = make_service_fn(|_| async { Ok::<_, Infallible>(service_fn(handle_request)) });
+    Server::bind(&bind_addr).serve(make_service).await
+}
+
+type EndpointResult = Response<Body>;
+
+async fn handle_request(request: Request<Body>) -> Result<EndpointResult, Infallible> {
+    if request.method() != Method::GET {
         warn!(
             "Rejecting request with unsupported method {:?} to {}",
             request.method(),
-            request.url()
+            request.uri()
         );
-        let response = Response::from_string("method not allowed").with_status_code(405);
-        request.respond(response)?;
-        return Ok(());
+        return Ok(text_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"));
     }
 
-    let (path, _) = request
-        .url()
-        .split_once('?')
-        .map(|(left, _)| (left, ()))
-        .unwrap_or((request.url(), ()));
-
-    let segments: Vec<&str> = path
+    let segments: Vec<&str> = request
+        .uri()
+        .path()
         .trim_start_matches('/')
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect();
 
     let Some(result) = dispatch_endpoint(&segments) else {
-        let response = Response::from_string("not found").with_status_code(404);
-        request.respond(response)?;
-        return Ok(());
+        return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
     };
 
-    let mut response = Response::from_string(result.body).with_status_code(result.status);
-    if let Ok(header) = Header::from_bytes(b"Content-Type", result.content_type.as_bytes()) {
-        response = response.with_header(header);
+    Ok(endpoint_response(result))
+}
+
+fn endpoint_response(result: EndpointResponse) -> EndpointResult {
+    let status = StatusCode::from_u16(result.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut response = Response::builder()
+        .status(status)
+        .body(Body::from(result.body))
+        .expect("failed to build response");
+    if let Ok(value) = HeaderValue::from_str(result.content_type) {
+        response.headers_mut().insert(CONTENT_TYPE, value);
     }
-    request.respond(response)?;
-    Ok(())
+    response
+}
+
+fn text_response(status: StatusCode, body: &str) -> EndpointResult {
+    let mut response = Response::builder()
+        .status(status)
+        .body(Body::from(body.to_string()))
+        .expect("failed to build text response");
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+    response
 }
 
 fn dispatch_endpoint(segments: &[&str]) -> Option<EndpointResponse> {
