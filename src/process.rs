@@ -1,26 +1,15 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use anyhow::{anyhow, Context, Result};
-use async_trait::async_trait;
-use bytes::Bytes;
-use wasmtime::{Engine, Linker, Module, Store};
-use wasmtime_wasi::preview1::{self, WasiP1Ctx};
-use wasmtime_wasi::{HostOutputStream, StdoutStream, StreamResult, Subscribe, WasiCtxBuilder};
 
 use crate::config::Service;
-use crate::logs::{record_log_line, SharedLogMap};
-
-const WASM_TARGET: &str = "wasm32-wasip1";
-const WASM_PROFILE: &str = "release";
+use crate::logs::{spawn_log_forwarder, SharedLogMap};
 
 fn module_directory(module_name: &str) -> PathBuf {
-    Path::new("services")
-        .join(module_name)
-        .join("target")
-        .join(WASM_TARGET)
-        .join(WASM_PROFILE)
+    Path::new("services").join(module_name)
 }
 
 fn module_path(module_name: &str) -> Result<PathBuf> {
@@ -40,7 +29,7 @@ fn module_path(module_name: &str) -> Result<PathBuf> {
 }
 
 pub fn run_module(module_name: &str) -> Result<()> {
-    run_module_with_streams(module_name, None, None)
+    run_module_with_output(module_name, OutputMode::Inherit)
 }
 
 pub struct ServiceModuleHandle {
@@ -54,16 +43,18 @@ pub fn start_service_modules(
     let mut handles = Vec::new();
 
     for service in services {
-        let stdout_stream = LogStream::new(&service.name, "stdout", logs);
-        let stderr_stream = LogStream::new(&service.name, "stderr", logs);
         let module_name = service.name.clone();
+        let log_store = Arc::clone(logs);
 
         let handle = thread::Builder::new()
             .name(format!("svc-{}", module_name))
             .spawn(move || {
-                if let Err(error) =
-                    run_module_with_streams(&module_name, Some(stdout_stream), Some(stderr_stream))
-                {
+                let output = OutputMode::Forward {
+                    service_name: module_name.clone(),
+                    logs: log_store,
+                };
+
+                if let Err(error) = run_module_with_output(&module_name, output) {
                     eprintln!("service '{module_name}' exited with error: {error:?}");
                 }
             })
@@ -75,158 +66,72 @@ pub fn start_service_modules(
     Ok(handles)
 }
 
-fn run_module_with_streams(
-    module_name: &str,
-    stdout_stream: Option<LogStream>,
-    stderr_stream: Option<LogStream>,
-) -> Result<()> {
+enum OutputMode {
+    Inherit,
+    Forward {
+        service_name: String,
+        logs: SharedLogMap,
+    },
+}
+
+fn run_module_with_output(module_name: &str, output: OutputMode) -> Result<()> {
     let wasm_path = module_path(module_name)?;
 
-    let engine = Engine::default();
-    let module = Module::from_file(&engine, &wasm_path).with_context(|| {
-        format!(
-            "failed to load module '{}': {}",
-            module_name,
-            wasm_path.display()
-        )
-    })?;
+    let mut command = Command::new("wasmedge");
+    command.arg(&wasm_path);
 
-    let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
-    preview1::add_to_linker_sync(&mut linker, |ctx: &mut WasiP1Ctx| ctx)
-        .context("failed to configure WASI imports")?;
-
-    let precompiled = linker.instantiate_pre(&module).with_context(|| {
-        format!(
-            "failed to prepare module '{}' for instantiation",
-            module_name
-        )
-    })?;
-
-    let mut wasi_ctx_builder = WasiCtxBuilder::new();
-    wasi_ctx_builder.inherit_network();
-    wasi_ctx_builder.allow_ip_name_lookup(true);
-
-    match stdout_stream {
-        Some(stream) => {
-            wasi_ctx_builder.stdout(stream);
+    match output {
+        OutputMode::Inherit => {
+            command.stdout(Stdio::inherit());
+            command.stderr(Stdio::inherit());
+            let status = command
+                .status()
+                .with_context(|| format!("failed to execute module '{module_name}'"))?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "module '{}' exited with non-zero status {status}",
+                    module_name
+                ))
+            }
         }
-        None => {
-            wasi_ctx_builder.inherit_stdout();
+        OutputMode::Forward {
+            service_name,
+            logs,
+        } => {
+            command.stdout(Stdio::piped());
+            command.stderr(Stdio::piped());
+
+            let mut child = command
+                .spawn()
+                .with_context(|| format!("failed to execute module '{module_name}'"))?;
+
+            if let Some(stdout) = child.stdout.take() {
+                spawn_log_forwarder(
+                    service_name.clone(),
+                    stdout,
+                    "stdout",
+                    Arc::clone(&logs),
+                );
+            }
+
+            if let Some(stderr) = child.stderr.take() {
+                spawn_log_forwarder(service_name.clone(), stderr, "stderr", logs);
+            }
+
+            let status = child
+                .wait()
+                .with_context(|| format!("failed while waiting for '{module_name}'"))?;
+
+            if status.success() {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "module '{}' exited with non-zero status {status}",
+                    module_name
+                ))
+            }
         }
-    }
-
-    match stderr_stream {
-        Some(stream) => {
-            wasi_ctx_builder.stderr(stream);
-        }
-        None => {
-            wasi_ctx_builder.inherit_stderr();
-        }
-    }
-
-    let wasi_ctx = wasi_ctx_builder.build_p1();
-    let mut store = Store::new(&engine, wasi_ctx);
-
-    let instance = precompiled
-        .instantiate(&mut store)
-        .with_context(|| format!("failed to instantiate module '{}'", module_name))?;
-
-    let start = instance
-        .get_typed_func::<(), ()>(&mut store, "_start")
-        .context("module is missing the '_start' entrypoint")?;
-
-    start
-        .call(&mut store, ())
-        .with_context(|| format!("module '{}' exited with an error", module_name))
-}
-
-#[derive(Clone)]
-struct LogStream {
-    inner: Arc<LogStreamInner>,
-}
-
-impl LogStream {
-    fn new(service_name: &str, stream_label: &'static str, logs: &SharedLogMap) -> Self {
-        LogStream {
-            inner: Arc::new(LogStreamInner {
-                service_name: service_name.to_string(),
-                stream_label,
-                logs: Arc::clone(logs),
-                buffer: Mutex::new(String::new()),
-            }),
-        }
-    }
-}
-
-impl StdoutStream for LogStream {
-    fn stream(&self) -> Box<dyn HostOutputStream> {
-        Box::new(LogWriteStream {
-            inner: Arc::clone(&self.inner),
-        })
-    }
-
-    fn isatty(&self) -> bool {
-        false
-    }
-}
-
-struct LogStreamInner {
-    service_name: String,
-    stream_label: &'static str,
-    logs: SharedLogMap,
-    buffer: Mutex<String>,
-}
-
-impl LogStreamInner {
-    fn write_bytes(&self, chunk: &[u8]) {
-        let mut buffer = self.buffer.lock().unwrap();
-        buffer.push_str(&String::from_utf8_lossy(chunk));
-
-        while let Some(pos) = buffer.find('\n') {
-            let line: String = buffer.drain(..=pos).collect();
-            self.emit_line(line);
-        }
-    }
-
-    fn flush(&self) {
-        let mut buffer = self.buffer.lock().unwrap();
-        if buffer.is_empty() {
-            return;
-        }
-        let line: String = buffer.drain(..).collect();
-        drop(buffer);
-        self.emit_line(line);
-    }
-
-    fn emit_line(&self, mut line: String) {
-        while line.ends_with('\n') || line.ends_with('\r') {
-            line.pop();
-        }
-        record_log_line(&self.service_name, &line, self.stream_label, &self.logs);
-    }
-}
-
-struct LogWriteStream {
-    inner: Arc<LogStreamInner>,
-}
-
-#[async_trait]
-impl Subscribe for LogWriteStream {
-    async fn ready(&mut self) {}
-}
-
-impl HostOutputStream for LogWriteStream {
-    fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
-        self.inner.write_bytes(bytes.as_ref());
-        Ok(())
-    }
-
-    fn flush(&mut self) -> StreamResult<()> {
-        self.inner.flush();
-        Ok(())
-    }
-
-    fn check_write(&mut self) -> StreamResult<usize> {
-        Ok(usize::MAX / 2)
     }
 }

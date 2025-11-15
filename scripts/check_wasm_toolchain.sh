@@ -20,3 +20,8 @@ else
     echo "  rustup target add ${TARGET}" >&2
     exit 1
 fi
+
+if ! command -v wasmedge >/dev/null 2>&1; then
+    echo "wasmedge is required to compile the final WebAssembly artifact." >&2
+    exit 1
+fi

@@ -20,12 +20,17 @@ build_module() {
         return 0
     fi
 
-    cargo build --target "$TARGET" --release --manifest-path "$manifest_path"
+    RUSTFLAGS="--cfg wasmedge --cfg tokio_unstable" cargo build \
+        --target "$TARGET" \
+        --release \
+        --manifest-path "$manifest_path"
 
     local wasm_path="$module_dir/target/${TARGET}/release/$module_name.wasm"
 
     if [ -f "$wasm_path" ]; then
-        echo "Built WebAssembly module at $wasm_path"
+        local output_wasm="$module_dir/$module_name.wasm"
+        wasmedge compile "$wasm_path" "$output_wasm"
+        echo "Generated WasmEdge module at $output_wasm"
     else
         echo "Failed to build WebAssembly module for $module_name" >&2
         return 1
