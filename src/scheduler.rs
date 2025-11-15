@@ -84,6 +84,60 @@ pub fn toggle_schedule(
     Ok(state.paused)
 }
 
+#[derive(Debug)]
+pub enum TriggerError {
+    ServiceNotFound,
+    ScheduleNotFound,
+    LockPoisoned,
+}
+
+#[derive(Clone, Debug)]
+pub struct TriggerOutcome {
+    pub last_run: Option<Instant>,
+    pub last_status: Option<u16>,
+    pub last_error: Option<String>,
+}
+
+pub fn trigger_schedule_now(
+    map: &SharedScheduleMap,
+    service_name: &str,
+    index: usize,
+    base_url: &str,
+    endpoint: &str,
+) -> Result<TriggerOutcome, TriggerError> {
+    let url = format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        endpoint.trim_start_matches('/')
+    );
+
+    let result = execute_webhook(service_name, endpoint, &url);
+    let (status, error_message) = match result {
+        Ok(status) => (Some(status), None),
+        Err(error) => (None, Some(error)),
+    };
+
+    let now = Instant::now();
+
+    let mut guard = map.lock().map_err(|_| TriggerError::LockPoisoned)?;
+    let entries = guard
+        .get_mut(service_name)
+        .ok_or(TriggerError::ServiceNotFound)?;
+    let state = entries
+        .get_mut(index)
+        .ok_or(TriggerError::ScheduleNotFound)?;
+
+    state.last_run = Some(now);
+    state.last_status = status;
+    state.last_error = error_message.clone();
+
+    Ok(TriggerOutcome {
+        last_run: state.last_run,
+        last_status: state.last_status,
+        last_error: state.last_error.clone(),
+    })
+}
+
 fn run_schedule(
     schedules: SharedScheduleMap,
     service_name: String,

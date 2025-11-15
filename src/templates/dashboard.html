@@ -266,7 +266,7 @@
 
           button.disabled = true;
           try {
-            const response = await fetch('/__runner__/schedules/' + encodeURIComponent(service) + '/' + index, {
+            const response = await fetch('/__runner__/services/' + encodeURIComponent(service) + '/schedules/' + index + '/toggle', {
               method: 'POST',
             });
             if (!response.ok) {
@@ -284,6 +284,46 @@
             console.error('schedule toggle failed', error);
           } finally {
             button.disabled = false;
+          }
+        });
+      });
+
+      document.querySelectorAll('.schedule-run').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const service = button.getAttribute('data-service');
+          const index = button.getAttribute('data-index');
+          if (!service || index === null) {
+            return;
+          }
+
+          const originalLabel = button.textContent || '';
+          button.disabled = true;
+          button.textContent = 'Lanzando...';
+
+          try {
+            const response = await fetch('/__runner__/services/' + encodeURIComponent(service) + '/schedules/' + index + '/run', {
+              method: 'POST',
+            });
+            if (!response.ok) {
+              throw new Error('No se pudo ejecutar el webhook');
+            }
+            const payload = await response.json();
+            const scheduleItem = button.closest('.schedule-item');
+            if (scheduleItem && payload) {
+              const resultEl = scheduleItem.querySelector('.schedule-item__result');
+              if (resultEl && payload.status_text) {
+                resultEl.textContent = payload.status_text;
+              }
+              const timeEl = scheduleItem.querySelector('.schedule-item__time');
+              if (timeEl && payload.time_text) {
+                timeEl.textContent = payload.time_text;
+              }
+            }
+          } catch (error) {
+            console.error('schedule run failed', error);
+          } finally {
+            button.disabled = false;
+            button.textContent = originalLabel || 'Lanzar ahora';
           }
         });
       });

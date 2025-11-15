@@ -12,7 +12,7 @@ use crate::health::{HealthStatus, SharedHealthMap};
 use crate::logs::SharedLogMap;
 use crate::memory::{ServiceMemorySnapshot, SharedMemoryMap};
 use crate::queue::{with_queue_registry, QueueSnapshot, SharedQueueRegistry};
-use crate::scheduler::{self, ScheduleState, SharedScheduleMap, ToggleError};
+use crate::scheduler::{self, ScheduleState, SharedScheduleMap, ToggleError, TriggerError};
 use crate::stats::{record_http_status, SharedStats};
 use crate::templates;
 use serde_json::json;
@@ -72,6 +72,10 @@ fn handle_request(
             return handle_queue_publish(queues, request, queue_name);
         }
 
+        if let Some(rest) = trimmed_path.strip_prefix("__runner__/services/") {
+            return handle_internal_service_control(services, schedules, request, rest);
+        }
+
         let response = Response::from_string("not found").with_status_code(404);
         request.respond(response)?;
         return Ok(());
@@ -100,7 +104,7 @@ fn handle_request(
     }
 
     if let Some(rest) = trimmed_path.strip_prefix("__runner__/services/") {
-        return handle_internal_service_request(services, logs, schedules, request, rest);
+        return handle_internal_service_request(services, logs, request, rest);
     }
 
     let Some((service, endpoint_path)) = resolve_service_route(services, trimmed_path) else {
@@ -175,7 +179,6 @@ fn handle_stats_request(stats: &SharedStats, request: Request) -> Result<()> {
 fn handle_internal_service_request(
     services: &[Service],
     logs: &SharedLogMap,
-    schedules: &SharedScheduleMap,
     request: Request,
     rest: &str,
 ) -> Result<()> {
@@ -255,7 +258,8 @@ fn handle_internal_service_request(
             }
         }
         "schedules" => {
-            return handle_schedule_request(service_name, schedules, request, &remaining);
+            let response = Response::from_string("method not allowed").with_status_code(405);
+            request.respond(response)?;
         }
         _ => {
             let response = Response::from_string("not found").with_status_code(404);
@@ -264,6 +268,41 @@ fn handle_internal_service_request(
     }
 
     Ok(())
+}
+
+fn handle_internal_service_control(
+    services: &[Service],
+    schedules: &SharedScheduleMap,
+    request: Request,
+    rest: &str,
+) -> Result<()> {
+    let mut segments = rest.split('/').filter(|segment| !segment.is_empty());
+    let Some(service_name) = segments.next() else {
+        let response = Response::from_string("not found").with_status_code(404);
+        request.respond(response)?;
+        return Ok(());
+    };
+
+    let Some(action) = segments.next() else {
+        let response = Response::from_string("not found").with_status_code(404);
+        request.respond(response)?;
+        return Ok(());
+    };
+
+    if action != "schedules" {
+        let response = Response::from_string("not found").with_status_code(404);
+        request.respond(response)?;
+        return Ok(());
+    }
+
+    if !services.iter().any(|service| service.name == service_name) {
+        let response = Response::from_string("not found").with_status_code(404);
+        request.respond(response)?;
+        return Ok(());
+    }
+
+    let remaining: Vec<_> = segments.collect();
+    handle_schedule_request(services, service_name, schedules, request, &remaining)
 }
 
 fn handle_queue_publish(
@@ -338,12 +377,13 @@ fn handle_queue_publish(
 }
 
 fn handle_schedule_request(
+    services: &[Service],
     service_name: &str,
     schedules: &SharedScheduleMap,
     request: Request,
     remaining: &[&str],
 ) -> Result<()> {
-    if remaining.len() != 2 || remaining[1] != "toggle" {
+    if remaining.len() != 2 {
         let response = Response::from_string("not found").with_status_code(404);
         request.respond(response)?;
         return Ok(());
@@ -358,22 +398,80 @@ fn handle_schedule_request(
         }
     };
 
-    match scheduler::toggle_schedule(schedules, service_name, index) {
-        Ok(paused) => {
-            let payload = json!({ "paused": paused });
-            let mut response = Response::from_string(payload.to_string()).with_status_code(200);
-            if let Ok(header) = Header::from_bytes(b"Content-Type", b"application/json") {
-                response = response.with_header(header);
+    match remaining[1] {
+        "toggle" => match scheduler::toggle_schedule(schedules, service_name, index) {
+            Ok(paused) => {
+                let payload = json!({ "paused": paused });
+                let mut response = Response::from_string(payload.to_string()).with_status_code(200);
+                if let Ok(header) = Header::from_bytes(b"Content-Type", b"application/json") {
+                    response = response.with_header(header);
+                }
+                request.respond(response)?;
             }
-            request.respond(response)?;
+            Err(ToggleError::ServiceNotFound | ToggleError::ScheduleNotFound) => {
+                let response = Response::from_string("not found").with_status_code(404);
+                request.respond(response)?;
+            }
+            Err(ToggleError::LockPoisoned) => {
+                let response =
+                    Response::from_string("schedule controller unavailable").with_status_code(503);
+                request.respond(response)?;
+            }
+        },
+        "run" => {
+            let Some(service) = services.iter().find(|svc| svc.name == service_name) else {
+                let response = Response::from_string("not found").with_status_code(404);
+                request.respond(response)?;
+                return Ok(());
+            };
+
+            let Some(schedule_config) = service.schedules.get(index) else {
+                let response = Response::from_string("not found").with_status_code(404);
+                request.respond(response)?;
+                return Ok(());
+            };
+
+            match scheduler::trigger_schedule_now(
+                schedules,
+                service_name,
+                index,
+                &service.base_url,
+                &schedule_config.endpoint,
+            ) {
+                Ok(outcome) => {
+                    let status_text = match (&outcome.last_error, outcome.last_status) {
+                        (Some(error), _) => format!("Último error: {error}"),
+                        (None, Some(status)) => format!("Último HTTP: {status}"),
+                        (None, None) => "Aún no se ha ejecutado.".to_string(),
+                    };
+                    let time_text = match outcome.last_run {
+                        Some(instant) => describe_elapsed("Última ejecución", instant),
+                        None => "Pendiente de la primera ejecución".to_string(),
+                    };
+                    let payload = json!({
+                        "status_text": status_text,
+                        "time_text": time_text,
+                    });
+                    let mut response =
+                        Response::from_string(payload.to_string()).with_status_code(200);
+                    if let Ok(header) = Header::from_bytes(b"Content-Type", b"application/json") {
+                        response = response.with_header(header);
+                    }
+                    request.respond(response)?;
+                }
+                Err(TriggerError::ServiceNotFound | TriggerError::ScheduleNotFound) => {
+                    let response = Response::from_string("not found").with_status_code(404);
+                    request.respond(response)?;
+                }
+                Err(TriggerError::LockPoisoned) => {
+                    let response = Response::from_string("schedule controller unavailable")
+                        .with_status_code(503);
+                    request.respond(response)?;
+                }
+            }
         }
-        Err(ToggleError::ServiceNotFound | ToggleError::ScheduleNotFound) => {
+        _ => {
             let response = Response::from_string("not found").with_status_code(404);
-            request.respond(response)?;
-        }
-        Err(ToggleError::LockPoisoned) => {
-            let response =
-                Response::from_string("schedule controller unavailable").with_status_code(503);
             request.respond(response)?;
         }
     }
@@ -724,10 +822,15 @@ fn build_schedule_section(service_name: &str, entries: Option<&Vec<ScheduleState
         items.push_str(&format!(
             concat!(
                 "<li class=\"schedule-item rounded-lg border border-slate-800/80 bg-slate-900/50 p-4\" data-service=\"{service}\" data-index=\"{index}\">",
-                "  <div class=\"schedule-item__header flex flex-wrap items-center justify-between gap-3\">",
-                "    <span class=\"font-medium text-slate-200\"><code>{endpoint}</code></span>",
-                "    <span class=\"schedule-item__meta text-sm text-slate-400\">Cada {interval}s · <span class=\"schedule-item__state font-semibold text-slate-200\">{state_label}</span></span>",
-                "    <button type=\"button\" class=\"schedule-toggle inline-flex items-center justify-center rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-slate-200 transition hover:bg-slate-900 focus:outline-none focus:ring focus:ring-slate-500/40\" data-service=\"{service}\" data-index=\"{index}\" data-paused=\"{paused}\">{button_label}</button>",
+                "  <div class=\"schedule-item__header flex flex-wrap gap-3 sm:items-center sm:justify-between\">",
+                "    <div class=\"schedule-item__info flex min-w-[200px] flex-col gap-1\">",
+                "      <span class=\"font-medium text-slate-200\"><code>{endpoint}</code></span>",
+                "      <span class=\"schedule-item__meta text-sm text-slate-400\">Cada {interval}s · <span class=\"schedule-item__state font-semibold text-slate-200\">{state_label}</span></span>",
+                "    </div>",
+                "    <div class=\"schedule-item__actions flex flex-wrap gap-2\">",
+                "      <button type=\"button\" class=\"schedule-run inline-flex items-center justify-center rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold uppercase tracking-wide text-emerald-200 transition hover:bg-emerald-500/20 focus:outline-none focus:ring focus:ring-emerald-500/40\" data-service=\"{service}\" data-index=\"{index}\">Lanzar ahora</button>",
+                "      <button type=\"button\" class=\"schedule-toggle inline-flex items-center justify-center rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-slate-200 transition hover:bg-slate-900 focus:outline-none focus:ring focus:ring-slate-500/40\" data-service=\"{service}\" data-index=\"{index}\" data-paused=\"{paused}\">{button_label}</button>",
+                "    </div>",
                 "  </div>",
                 "  <div class=\"schedule-item__details mt-3 flex flex-col gap-1 text-xs text-slate-400\">",
                 "    <span class=\"schedule-item__result\">{status_text}</span>",

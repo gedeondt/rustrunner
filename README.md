@@ -1,13 +1,26 @@
-# rustrunner
+# wasmrunner
 
 ## Descripción general
 
-Este repositorio contiene un "runner" escrito en Rust que inicia servicios HTTP de ejemplo,
-los enruta mediante un punto de entrada único y expone un panel web con el estado de cada
-servicio. Cada servicio se distribuye como un módulo WebAssembly (WASI Preview 1) que el
-runner carga y ejecuta usando **WasmEdge**, por lo que es necesario compilar dichos módulos
-antes de arrancar el proceso principal y tener el runtime instalado. También se incluyen
-utilidades para verificar el entorno de desarrollo requerido.
+**wasmrunner** es un runtime para middleware de integraciones construido en Rust. El objetivo
+es ejecutar adaptadores y BFFs como módulos WebAssembly (WASI Preview 1), orquestarlos desde un
+único punto de entrada y ofrecer un panel para entender qué ocurre con cada integración:
+estado de salud, consumo de memoria, colas internas y ejecuciones programadas.
+
+Cada pieza de integración se empaqueta como un módulo Wasm que wasmrunner carga mediante
+**WasmEdge**. De esta forma obtenemos aislamiento ligero, arranques rápidos y la posibilidad de
+delegar parte de la lógica de integración (enriquecimientos, transformaciones, llamadas HTTP) a
+servicios independientes, ya sea un BFF, lógica de negocio o un adapter que conversa con un SaaS.
+El repositorio también incluye utilidades para verificar el entorno antes de levantar el runtime.
+
+## ¿Por qué un runtime para middleware?
+
+* **Un solo entrypoint** para exponer BFFs, negocio y adapters sin replicar infraestructura.
+* **Observabilidad integrada**: dashboard con salud, memoria, colas internas y webhooks.
+* **Ejecución determinista**: los módulos Wasm encapsulan la lógica de integración y se pueden
+  versionar/distribuir con el mismo contrato.
+* **Automatización**: colas y webhooks permiten coordinar integraciones (sincronizaciones periódicas,
+  disparo manual desde el dashboard o eventos entrantes).
 
 ## Requisitos previos
 
@@ -37,20 +50,20 @@ necesario.
    ./scripts/build_wasm_module.sh
    ```
 
-2. Compila y ejecuta el runner principal:
+2. Compila y ejecuta wasmrunner:
 
    ```bash
    cargo run
    ```
 
-3. El runner levantará automáticamente los módulos que encuentre en la carpeta `services/`
+3. wasmrunner levantará automáticamente los módulos que encuentre en la carpeta `services/`
    y quedará escuchando en `http://127.0.0.1:14000`.
 
 4. Abre la URL anterior en el navegador para ver el panel de resumen, donde se listan los
    servicios disponibles, su prefijo y el resultado del último sondeo de salud.
 
 5. Cada servicio expone sus propios endpoints bajo su puerto correspondiente y un endpoint
-   `GET /health` que responde con `200 OK`. El runner consulta este endpoint cada cinco segundos
+   `GET /health` que responde con `200 OK`. wasmrunner consulta este endpoint cada cinco segundos
    para actualizar el estado mostrado en el panel.
 
 ## Pila HTTP obligatoria
@@ -84,7 +97,7 @@ respetar esta convención para evitar incompatibilidades con WasmEdge.
 
 ## Webhooks programados
 
-Además del sondeo de salud, cada servicio puede declarar webhooks que el runner ejecutará de forma
+Además del sondeo de salud, cada servicio puede declarar webhooks que wasmrunner ejecutará de forma
 periódica. Basta con añadir el bloque `schedules` en `config/service.json`, por ejemplo:
 
 ```json
@@ -99,13 +112,13 @@ periódica. Basta con añadir el bloque `schedules` en `config/service.json`, po
 ```
 
 Cada entrada indica la ruta (relativa al servicio) y el intervalo de ejecución en segundos. El
-panel del runner muestra todas las tareas programadas, el resultado HTTP de la última ejecución y
+panel de wasmrunner muestra todas las tareas programadas, el resultado HTTP de la última ejecución y
 permite pausarlas o reanudarlas individualmente.
 
 ### Límite de memoria por servicio
 
 El campo opcional `memory_limit_mb` establece la cuota máxima de memoria lineal que WasmEdge puede
-asignar al módulo. El runner convierte automáticamente ese valor a páginas WebAssembly (cada una de
+asignar al módulo. wasmrunner convierte automáticamente ese valor a páginas WebAssembly (cada una de
 64 KiB) y pasa `--memory-page-limit` al CLI cuando arranca el servicio —incluyendo ejecuciones
 directas vía `cargo run -- --module <nombre>`. Por ejemplo, `64` equivale a `64 * 1024 / 64 = 1024`
 páginas (≈64 MB). Si un servicio excede el límite configurado, WasmEdge lo terminará con un error.
@@ -114,8 +127,8 @@ páginas (≈64 MB). Si un servicio excede el límite configurado, WasmEdge lo
 
 | Carpeta | Descripción |
 |---------|-------------|
-| `src/` | Código fuente del runner y su API HTTP. |
-| `services/` | Servicios de ejemplo que el runner puede lanzar y monitorear. |
+| `src/` | Código fuente del runtime y su API HTTP. |
+| `services/` | Servicios de ejemplo que wasmrunner puede lanzar y monitorear. |
 | `scripts/` | Utilidades para comprobar requisitos del entorno. |
 
 Cada carpeta cuenta con un `README.md` adicional que profundiza en su contenido.
@@ -123,7 +136,7 @@ Cada carpeta cuenta con un `README.md` adicional que profundiza en su contenido.
 ## Flujos habituales
 
 * **Ver estado de los servicios**: visitar `http://127.0.0.1:14000` para revisar el resumen.
-* **Consultar un servicio concreto**: acceder al runner con el prefijo definido en su
+* **Consultar un servicio concreto**: acceder a wasmrunner con el prefijo definido en su
   configuración, por ejemplo `http://127.0.0.1:14000/hello/hello`.
 * **Revisar el healthcheck de un servicio**: `curl http://127.0.0.1:15001/health` (o el puerto
   que corresponda).
