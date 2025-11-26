@@ -71,6 +71,7 @@ necesita un comportamiento especial por réplica (p. ej. métricas), puedes cons
 * `atencion_cliente_bff`: Backend for Frontend orientado a la app de clientes del banco.
 * `atencion_cuenta_business`: servicio de negocio con el detalle de cuentas de cliente.
 * `facturacion_sap_adapter`: adapter que aproxima la API de SAP para facturación y cobros.
+* `shopify_orders_adapter`: adapter que envuelve los pedidos de Shopify y publica eventos internos.
 
 ## Límites de memoria
 

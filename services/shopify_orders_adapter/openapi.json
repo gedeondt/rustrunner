@@ -1,0 +1,67 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Adapter de pedidos Shopify",
+    "version": "1.0.0",
+    "description": "Envuelve el API de pedidos de Shopify y publica eventos ShopifyOrderCreated en la cola interna del runner."
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Verifica la salud del servicio",
+        "responses": {
+          "200": {
+            "description": "El servicio está disponible."
+          }
+        }
+      }
+    },
+    "/shopify/orders": {
+      "get": {
+        "summary": "Lista pedidos recientes desde Shopify",
+        "responses": {
+          "200": {
+            "description": "Colección de pedidos simulados."
+          }
+        }
+      }
+    },
+    "/shopify/orders/{orderId}": {
+      "get": {
+        "summary": "Obtiene el detalle de un pedido concreto",
+        "parameters": [
+          {
+            "name": "orderId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Detalle del pedido."
+          },
+          "404": {
+            "description": "Pedido no encontrado."
+          }
+        }
+      }
+    },
+    "/webhooks/orders/pull": {
+      "get": {
+        "summary": "Simula la sincronización y publica eventos de pedidos nuevos",
+        "responses": {
+          "202": {
+            "description": "Eventos publicados en la cola interna."
+          },
+          "204": {
+            "description": "No hay pedidos nuevos que publicar."
+          },
+          "500": {
+            "description": "Falló la publicación de eventos."
+          }
+        }
+      }
+    }
+  }
+}

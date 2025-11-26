@@ -1,0 +1,10 @@
+{
+  "prefix": "shopify-adapter",
+  "url": "http://127.0.0.1:15004",
+  "domain": "ecommerce",
+  "type": "adapter",
+  "memory_limit_mb": 96,
+  "schedules": [
+    { "endpoint": "/webhooks/orders/pull", "interval_secs": 120 }
+  ]
+}
