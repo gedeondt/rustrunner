@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
+use std::sync::Mutex;
 use std::time::Instant;
 use std::time::SystemTime;
 use tiny_http::{Header, Method, Request, Response, Server};
@@ -18,6 +19,48 @@ use crate::templates;
 use serde_json::json;
 
 const ENTRY_PORT: u16 = 14000;
+
+struct RoundRobinRouter {
+    counters: Mutex<HashMap<String, usize>>,
+}
+
+impl RoundRobinRouter {
+    fn new(services: &[Service]) -> Self {
+        let mut counters = HashMap::new();
+        for service in services {
+            counters.insert(service.name.clone(), 0);
+        }
+        Self {
+            counters: Mutex::new(counters),
+        }
+    }
+
+    fn next_base_url(&self, service: &Service) -> String {
+        let endpoints = service.runner_endpoints();
+        if endpoints.len() <= 1 {
+            return endpoints
+                .first()
+                .cloned()
+                .unwrap_or_else(|| service.base_url.clone());
+        }
+
+        let index = match self.counters.lock() {
+            Ok(mut guard) => {
+                let counter = guard.entry(service.name.clone()).or_insert(0);
+                let current = *counter;
+                *counter = current.wrapping_add(1);
+                current
+            }
+            Err(_) => 0,
+        };
+
+        let position = index % endpoints.len();
+        endpoints
+            .get(position)
+            .cloned()
+            .unwrap_or_else(|| service.base_url.clone())
+    }
+}
 
 pub fn run_server(
     services: &[Service],
@@ -37,10 +80,11 @@ pub fn run_server(
     })?;
 
     println!("Runner listening on http://{}:{}", "0.0.0.0", ENTRY_PORT);
+    let router = RoundRobinRouter::new(services);
 
     for request in server.incoming_requests() {
         if let Err(error) = handle_request(
-            services, health, logs, schedules, stats, queues, memory, request,
+            services, health, logs, schedules, stats, queues, memory, &router, request,
         ) {
             eprintln!("Failed to handle request: {:#}", error);
         }
@@ -57,6 +101,7 @@ fn handle_request(
     stats: &SharedStats,
     queues: &SharedQueueRegistry,
     memory: &SharedMemoryMap,
+    router: &RoundRobinRouter,
     request: Request,
 ) -> Result<()> {
     let full_path = request.url().to_owned();
@@ -119,11 +164,8 @@ fn handle_request(
         return Ok(());
     }
 
-    let mut target_url = format!(
-        "{}/{}",
-        service.base_url.trim_end_matches('/'),
-        endpoint_path
-    );
+    let selected_base = router.next_base_url(service);
+    let mut target_url = format!("{}/{}", selected_base.trim_end_matches('/'), endpoint_path);
 
     if let Some(query) = query {
         target_url.push('?');
@@ -556,7 +598,7 @@ fn render_domain_sections(
             let services_html = cards.join("");
             category_sections.push_str(&format!(
                 concat!(
-                    "<details class=\"group rounded-xl border border-slate-800 bg-slate-900/40\" open>",
+                    "<details class=\"group rounded-xl border border-slate-800 bg-slate-900/40\">",
                     "  <summary class=\"flex cursor-pointer items-center justify-between gap-2 px-4 py-3 text-sm font-semibold text-slate-200 [&::-webkit-details-marker]:hidden\">",
                     "    <span>{summary}</span>",
                     "    <span class=\"text-slate-500 transition-transform group-open:-rotate-180\">⌄</span>",
@@ -574,7 +616,7 @@ fn render_domain_sections(
         output.push_str(&format!(
             concat!(
                 "<section class=\"rounded-2xl border border-slate-800 bg-slate-900/60 shadow-glow shadow-slate-950/30\">",
-                "  <details class=\"group\" open>",
+                "  <details class=\"group\">",
                 "    <summary class=\"flex cursor-pointer items-center justify-between gap-4 px-6 py-5 text-left [&::-webkit-details-marker]:hidden\">",
                 "      <div>",
                 "        <h2 class=\"text-2xl font-semibold text-white\">Dominio {domain}</h2>",
@@ -605,6 +647,7 @@ fn render_service_card(
     schedule_section: &str,
 ) -> String {
     let kind_label = service.kind.label();
+    let runner_count = service.runner_count();
 
     format!(
         concat!(
@@ -619,6 +662,7 @@ fn render_service_card(
             "        <div class=\"flex flex-col gap-1 text-sm text-slate-400\">",
             "          <span>Prefijo: <code class=\"text-slate-200\">{prefix}</code></span>",
             "          <span>Base URL: <code class=\"text-slate-200\">{base_url}</code></span>",
+            "          <span>Copias activas: <span class=\"text-slate-200\">{runner_count}</span></span>",
             "        </div>",
             "      </div>",
             "      <div class=\"flex flex-col items-start gap-3 sm:items-end\">",
@@ -640,6 +684,7 @@ fn render_service_card(
         kind = escape_html(kind_label),
         prefix = escape_html(&service.prefix),
         base_url = escape_html(&service.base_url),
+        runner_count = runner_count,
         status_badge = status_badge,
         last_checked = escape_html(last_checked),
         memory_section = memory_section,
@@ -1040,10 +1085,12 @@ mod tests {
             kind: ServiceKind::Business,
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
+            runner_urls: vec!["http://localhost:1234".into()],
             allowed_get_endpoints: Default::default(),
             queue_listeners: Vec::new(),
             schedules: Vec::new(),
             memory_limit_mb: None,
+            runner_instances: 1,
         };
         let services = vec![service];
 
@@ -1062,10 +1109,12 @@ mod tests {
             kind: ServiceKind::Adapter,
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
+            runner_urls: vec!["http://localhost:1234".into()],
             allowed_get_endpoints: Default::default(),
             queue_listeners: Vec::new(),
             schedules: Vec::new(),
             memory_limit_mb: None,
+            runner_instances: 1,
         };
         let services = vec![service];
 

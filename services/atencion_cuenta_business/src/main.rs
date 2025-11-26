@@ -20,7 +20,7 @@ struct EndpointResponse {
 }
 
 const SERVICE_NAME: &str = "cuenta-cliente-business";
-const PORT: u16 = 15002;
+const DEFAULT_PORT: u16 = 15002;
 const DEFAULT_RUNNER_BASE_URL: &str = "http://127.0.0.1:14000";
 const CUSTOMER_UPDATE_QUEUE: &str = "clientes.actualizado";
 const CUSTOMER_UPDATE_EVENT: &str = "ClienteActualizado";
@@ -32,16 +32,25 @@ async fn main() {
         .target(Target::Stdout)
         .init();
 
-    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT);
+    let port = resolve_port();
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
     info!(
         "Service '{SERVICE_NAME}' listening on http://{}:{}",
         "0.0.0.0",
-        PORT
+        port
     );
 
     if let Err(error) = run_http_server(bind_addr).await {
         error!("HTTP server exited with error: {error}");
     }
+}
+
+fn resolve_port() -> u16 {
+    env::var("WR_RUNNER_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(DEFAULT_PORT)
 }
 
 async fn run_http_server(bind_addr: SocketAddr) -> Result<(), hyper::Error> {

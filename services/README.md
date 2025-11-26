@@ -18,10 +18,11 @@ services/
   con `200 OK`. El runner consulta esta ruta cada cinco segundos para actualizar el panel.
 * **Configuración**: el archivo `config/service.json` define el prefijo de enrutamiento,
   la URL base (incluyendo el puerto), el dominio lógico (`domain`) y la tipología (`type`) que
-  puede ser `bff`, `business` o `adapter`. Además acepta `memory_limit_mb` para fijar el límite de
-  memoria asignado al módulo al ejecutarse en WasmEdge; este valor es opcional pero recomendable
-  para evitar que un servicio consuma más de lo previsto. También puede incluir un arreglo
-  `schedules` con pares `endpoint` + `interval_secs` para programar webhooks.
+  puede ser `bff`, `business` o `adapter`. El campo opcional `runners` indica cuántas copias
+  simultáneas levantará wasmrunner. El runtime reutiliza la URL base como puerto inicial y asigna
+  los siguientes puertos de forma incremental (`15001`, `15002`, …). Además acepta `memory_limit_mb`
+  para fijar el límite de memoria asignado al módulo y un arreglo `schedules` con pares
+  `endpoint` + `interval_secs` para programar webhooks.
 * **Documentación OpenAPI**: cada servicio debe incluir un `openapi.json` sencillo con la lista de
   rutas que ofrece. El runner valida cada petición entrante contra esta definición antes de
   reenviarla al servicio correspondiente.
@@ -52,6 +53,18 @@ reqwest = { git = "https://github.com/second-state/wasi_reqwest.git", branch = "
 No se admite ninguna otra librería (`ureq`, `surf`, variantes sin parches, etc.). Cada agente y
 servicio debe realizar las peticiones salientes únicamente con `reqwest` y exponer los endpoints
 HTTP usando `hyper` + `tokio`.
+
+## Variables de entorno inyectadas
+
+wasmrunner expone varias variables a cada servicio para coordinar las copias:
+
+* `WR_RUNNER_PORT`: puerto asignado al proceso actual.
+* `WR_RUNNER_INDEX`: índice de la réplica (empezando en 0).
+* `WR_RUNNER_INSTANCES`: número total de copias configuradas para el servicio.
+
+Los servicios de ejemplo ya leen `WR_RUNNER_PORT` para ajustar el `bind_addr`. Si tu integración
+necesita un comportamiento especial por réplica (p. ej. métricas), puedes consultar también
+`WR_RUNNER_INDEX` y `WR_RUNNER_INSTANCES`.
 
 ## Servicios incluidos
 

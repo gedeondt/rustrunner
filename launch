@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT_DIR"
+
+print_help() {
+    cat <<'EOF'
+Usage: ./launch [options] [-- <args para el runner>]
+
+Opciones:
+  --skip-wasm-build   Omite la compilación de servicios a WebAssembly.
+  --release           Ejecuta el runtime en modo release.
+  -h, --help          Muestra esta ayuda.
+
+Cualquier argumento después de `--` se pasa directamente al binario de wasmrunner.
+Ejemplo: ./launch -- --module hello
+EOF
+}
+
+SKIP_WASM_BUILD=0
+CARGO_FLAGS=()
+RUNNER_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --skip-wasm-build)
+            SKIP_WASM_BUILD=1
+            ;;
+        --release|-r)
+            CARGO_FLAGS+=("--release")
+            ;;
+        -h|--help)
+            print_help
+            exit 0
+            ;;
+        --)
+            shift
+            RUNNER_ARGS+=("$@")
+            break
+            ;;
+        *)
+            RUNNER_ARGS+=("$1")
+            ;;
+    esac
+    shift
+done
+
+if [[ $SKIP_WASM_BUILD -eq 0 ]]; then
+    echo ">> Verificando toolchain WASM..."
+    ./scripts/check_wasm_toolchain.sh
+    echo ">> Compilando servicios a WebAssembly..."
+    ./scripts/build_wasm_module.sh
+else
+    echo ">> Omitiendo compilación de servicios (--skip-wasm-build)."
+fi
+
+echo ">> Lanzando wasmrunner..."
+cargo run "${CARGO_FLAGS[@]}" -- "${RUNNER_ARGS[@]}"

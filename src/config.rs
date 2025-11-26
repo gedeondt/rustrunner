@@ -7,6 +7,7 @@ use serde::de::{self, Deserializer};
 use serde::Deserialize;
 use serde_json::Value;
 use tiny_http::Method;
+use url::Url;
 
 const MAX_MEMORY_LIMIT_MB: u64 = (u32::MAX as u64) / 16;
 
@@ -17,10 +18,12 @@ pub struct Service {
     pub kind: ServiceKind,
     pub prefix: String,
     pub base_url: String,
+    pub runner_urls: Vec<String>,
     pub allowed_get_endpoints: HashSet<String>,
     pub queue_listeners: Vec<ServiceQueueListener>,
     pub schedules: Vec<ServiceSchedule>,
     pub memory_limit_mb: Option<u64>,
+    pub runner_instances: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +35,18 @@ pub struct ServiceSchedule {
 impl Service {
     pub fn supports(&self, method: &Method, endpoint: &str) -> bool {
         matches!(method, &Method::Get) && self.allowed_get_endpoints.contains(endpoint)
+    }
+
+    pub fn runner_count(&self) -> usize {
+        self.runner_urls.len().max(1)
+    }
+
+    pub fn runner_endpoints(&self) -> &[String] {
+        if self.runner_urls.is_empty() {
+            std::slice::from_ref(&self.base_url)
+        } else {
+            &self.runner_urls
+        }
     }
 
     pub fn memory_page_limit(&self) -> Option<u32> {
@@ -72,12 +87,18 @@ struct RawServiceConfig {
     domain: String,
     #[serde(rename = "type")]
     kind: ServiceKind,
+    #[serde(default = "default_runner_instances")]
+    runners: usize,
     #[serde(default)]
     memory_limit_mb: Option<u64>,
     #[serde(default)]
     listeners: Vec<HashMap<String, String>>,
     #[serde(default)]
     schedules: Vec<RawScheduleConfig>,
+}
+
+fn default_runner_instances() -> usize {
+    1
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +185,7 @@ pub fn load_services() -> Result<Vec<Service>> {
             url,
             domain,
             kind,
+            runners,
             memory_limit_mb,
             listeners,
             schedules: raw_schedules,
@@ -174,16 +196,25 @@ pub fn load_services() -> Result<Vec<Service>> {
             .with_context(|| format!("failed to parse queue listeners for service '{}'", name))?;
         let schedules = normalize_service_schedules(&name, &allowed_get_endpoints, &raw_schedules)?;
 
+        let runner_urls = build_runner_urls(&name, &url, runners)?;
+        let base_url = runner_urls
+            .first()
+            .cloned()
+            .unwrap_or_else(|| url.trim_end_matches('/').to_string());
+        let runner_instances = runner_urls.len();
+
         services.push(Service {
             name,
             domain,
             kind,
             prefix,
-            base_url: url,
+            base_url,
+            runner_urls,
             allowed_get_endpoints,
             queue_listeners,
             schedules,
             memory_limit_mb,
+            runner_instances,
         });
     }
 
@@ -242,6 +273,10 @@ fn validate_service_config(name: &str, config: &RawServiceConfig) -> Result<()> 
         bail!("domain for service '{}' cannot be empty", name);
     }
 
+    if config.runners == 0 {
+        bail!("runners for service '{name}' must be at least 1");
+    }
+
     if let Some(limit) = config.memory_limit_mb {
         if limit == 0 {
             bail!("memory_limit_mb for service '{name}' must be greater than zero");
@@ -255,6 +290,53 @@ fn validate_service_config(name: &str, config: &RawServiceConfig) -> Result<()> 
     }
 
     Ok(())
+}
+
+fn build_runner_urls(name: &str, url: &str, runners: usize) -> Result<Vec<String>> {
+    let normalized = url.trim();
+    if normalized.is_empty() {
+        bail!("url for service '{name}' cannot be empty");
+    }
+
+    if runners == 1 {
+        return Ok(vec![normalized.trim_end_matches('/').to_string()]);
+    }
+
+    let parsed = Url::parse(normalized).with_context(|| {
+        format!(
+            "failed to parse URL '{}' for service '{}'",
+            normalized, name
+        )
+    })?;
+    let Some(start_port) = parsed.port_or_known_default() else {
+        bail!(
+            "service '{name}' must include a port in the URL to run multiple instances (found '{}')",
+            normalized
+        );
+    };
+
+    let mut urls = Vec::with_capacity(runners);
+    for offset in 0..runners {
+        let port = start_port as u32 + offset as u32;
+        if port > u16::MAX as u32 {
+            bail!(
+                "service '{name}' cannot allocate runner #{} because it would exceed TCP port range",
+                offset + 1
+            );
+        }
+
+        let mut clone = parsed.clone();
+        clone.set_port(Some(port as u16)).map_err(|_| {
+            anyhow!(
+                "failed to set port for runner #{} of service '{name}'",
+                offset + 1
+            )
+        })?;
+        let serialized: String = clone.into();
+        urls.push(serialized.trim_end_matches('/').to_string());
+    }
+
+    Ok(urls)
 }
 
 fn parse_queue_listeners(
@@ -494,10 +576,12 @@ mod tests {
             kind: ServiceKind::Business,
             prefix: "foo".into(),
             base_url: "http://localhost".into(),
+            runner_urls: vec!["http://localhost".into()],
             allowed_get_endpoints: ["ping".into()].into_iter().collect(),
             queue_listeners: Vec::new(),
             schedules: Vec::new(),
             memory_limit_mb: None,
+            runner_instances: 1,
         };
 
         assert!(service.supports(&Method::Get, "ping"));
@@ -513,10 +597,12 @@ mod tests {
             kind: ServiceKind::Business,
             prefix: "foo".into(),
             base_url: "http://localhost".into(),
+            runner_urls: vec!["http://localhost".into()],
             allowed_get_endpoints: HashSet::new(),
             queue_listeners: Vec::new(),
             schedules: Vec::new(),
             memory_limit_mb: Some(100),
+            runner_instances: 1,
         };
 
         assert_eq!(service.memory_page_limit(), Some(1600));

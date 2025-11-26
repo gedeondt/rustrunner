@@ -132,10 +132,12 @@ mod tests {
             kind: ServiceKind::Adapter,
             prefix: name.into(),
             base_url: url.into(),
+            runner_urls: vec![url.into()],
             allowed_get_endpoints: HashSet::new(),
             queue_listeners: Vec::new(),
             schedules: Vec::new(),
             memory_limit_mb: None,
+            runner_instances: 1,
         }
     }
 

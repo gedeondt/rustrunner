@@ -1,6 +1,6 @@
 use std::convert::Infallible;
+use std::env;
 use std::io::Write;
-
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use bytes::Bytes;
@@ -23,7 +23,7 @@ struct EndpointResponse {
 }
 
 const SERVICE_NAME: &str = "sap-debt-adapter";
-const PORT: u16 = 15003;
+const DEFAULT_PORT: u16 = 15003;
 const CUSTOMER_UPDATE_QUEUE_ENDPOINT: &str = "queues/cliente-actualizado";
 
 #[tokio::main(flavor = "current_thread")]
@@ -33,16 +33,25 @@ async fn main() {
         .target(Target::Stdout)
         .init();
 
-    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT);
+    let port = resolve_port();
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
     info!(
         "Service '{SERVICE_NAME}' listening on http://{}:{}",
         "0.0.0.0",
-        PORT
+        port
     );
 
     if let Err(error) = run_http_server(bind_addr).await {
         error!("HTTP server exited with error: {error}");
     }
+}
+
+fn resolve_port() -> u16 {
+    env::var("WR_RUNNER_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(DEFAULT_PORT)
 }
 
 async fn run_http_server(bind_addr: SocketAddr) -> Result<(), hyper::Error> {

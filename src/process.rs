@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use sysinfo::{Pid, System};
+use url::Url;
 
 use crate::config::{self, Service};
 use crate::logs::{spawn_log_forwarder, SharedLogMap};
@@ -34,7 +35,13 @@ fn module_path(module_name: &str) -> Result<PathBuf> {
 
 pub fn run_module(module_name: &str) -> Result<()> {
     let memory_page_limit = lookup_memory_page_limit(module_name);
-    run_module_with_output(module_name, memory_page_limit, OutputMode::Inherit, None)
+    run_module_with_output(
+        module_name,
+        memory_page_limit,
+        OutputMode::Inherit,
+        None,
+        None,
+    )
 }
 
 fn lookup_memory_page_limit(module_name: &str) -> Option<u32> {
@@ -64,34 +71,79 @@ pub fn start_service_modules(
     let mut handles = Vec::new();
 
     for service in services {
-        let module_name = service.name.clone();
-        let log_store = Arc::clone(logs);
-        let memory_page_limit = service.memory_page_limit();
-        let memory_store = Arc::clone(memory);
+        let instance_count = service.runner_endpoints().len().max(1);
+        for (instance_index, instance_url) in service.runner_endpoints().iter().cloned().enumerate()
+        {
+            let module_name = service.name.clone();
+            let log_store = Arc::clone(logs);
+            let memory_page_limit = service.memory_page_limit();
+            let memory_store = Arc::clone(memory);
+            let instance_total = instance_count;
 
-        let handle = thread::Builder::new()
-            .name(format!("svc-{}", module_name))
-            .spawn(move || {
-                let output = OutputMode::Forward {
-                    service_name: module_name.clone(),
-                    logs: log_store,
-                };
+            let handle = thread::Builder::new()
+                .name(format!("svc-{}-{}", module_name, instance_index))
+                .spawn(move || {
+                    let output = OutputMode::Forward {
+                        service_name: module_name.clone(),
+                        logs: log_store,
+                    };
+                    let env_overrides =
+                        build_instance_env(instance_index, instance_total, &instance_url);
+                    let env_slice = if env_overrides.is_empty() {
+                        None
+                    } else {
+                        Some(env_overrides.as_slice())
+                    };
 
-                if let Err(error) = run_module_with_output(
-                    &module_name,
-                    memory_page_limit,
-                    output,
-                    Some(memory_store),
-                ) {
-                    eprintln!("service '{module_name}' exited with error: {error:?}");
-                }
-            })
-            .with_context(|| format!("failed to spawn thread for service '{}'", service.name))?;
+                    if let Err(error) = run_module_with_output(
+                        &module_name,
+                        memory_page_limit,
+                        output,
+                        env_slice,
+                        Some(memory_store),
+                    ) {
+                        eprintln!(
+                            "service '{module_name}' (instance {instance_index}) exited with error: {error:?}"
+                        );
+                    }
+                })
+                .with_context(|| {
+                    format!(
+                        "failed to spawn thread for service '{}' (instance {})",
+                        service.name, instance_index
+                    )
+                })?;
 
-        handles.push(ServiceModuleHandle { _join: handle });
+            handles.push(ServiceModuleHandle { _join: handle });
+        }
     }
 
     Ok(handles)
+}
+
+fn build_instance_env(
+    instance_index: usize,
+    total_instances: usize,
+    instance_url: &str,
+) -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+    vars.push(("WR_RUNNER_INDEX".to_string(), instance_index.to_string()));
+    vars.push((
+        "WR_RUNNER_INSTANCES".to_string(),
+        total_instances.to_string(),
+    ));
+
+    if let Some(port) = port_from_url(instance_url) {
+        vars.push(("WR_RUNNER_PORT".to_string(), port.to_string()));
+    }
+
+    vars
+}
+
+fn port_from_url(url: &str) -> Option<u16> {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.port_or_known_default())
 }
 
 enum OutputMode {
@@ -106,6 +158,7 @@ fn run_module_with_output(
     module_name: &str,
     memory_page_limit: Option<u32>,
     output: OutputMode,
+    extra_env: Option<&[(String, String)]>,
     memory_store: Option<SharedMemoryMap>,
 ) -> Result<()> {
     let wasm_path = module_path(module_name)?;
@@ -116,6 +169,12 @@ fn run_module_with_output(
         command.arg(limit.to_string());
     }
     command.arg(&wasm_path);
+
+    if let Some(envs) = extra_env {
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+    }
 
     match output {
         OutputMode::Inherit => {

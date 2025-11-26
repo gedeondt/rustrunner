@@ -105,6 +105,7 @@ periódica. Basta con añadir el bloque `schedules` en `config/service.json`, po
   "prefix": "hello",
   "url": "http://127.0.0.1:15001",
   "memory_limit_mb": 64,
+  "runners": 2,
   "schedules": [
     { "endpoint": "/hello", "interval_secs": 60 }
   ]
@@ -114,6 +115,24 @@ periódica. Basta con añadir el bloque `schedules` en `config/service.json`, po
 Cada entrada indica la ruta (relativa al servicio) y el intervalo de ejecución en segundos. El
 panel de wasmrunner muestra todas las tareas programadas, el resultado HTTP de la última ejecución y
 permite pausarlas o reanudarlas individualmente.
+
+## Runners simultáneos y balanceo
+
+El campo opcional `runners` dentro de `config/service.json` indica cuántas copias de un servicio
+debe lanzar wasmrunner. A partir de la URL base se calcula un rango de puertos consecutivos, por lo
+que `"url": "http://127.0.0.1:15001", "runners": 3` generará procesos en los puertos `15001`,
+`15002` y `15003`. El reverse proxy interno reparte todas las peticiones HTTP del prefijo asignado
+en round-robin entre estas copias y también ofrece controles para seguir pausando webhooks o lanzar
+uno bajo demanda.
+
+Cada servicio recibe variables de entorno adicionales:
+
+* `WR_RUNNER_PORT`: puerto concreto asignado a la instancia.
+* `WR_RUNNER_INDEX`: índice (0..N-1) dentro del grupo de runners.
+* `WR_RUNNER_INSTANCES`: número total de copias configuradas.
+
+Los servicios de ejemplo usan `WR_RUNNER_PORT` para ajustar el socket HTTP dinámicamente, pero
+puedes reutilizar las otras variables para métricas o tareas internas si lo necesitas.
 
 ### Límite de memoria por servicio
 

@@ -100,10 +100,12 @@ mod tests {
             kind: ServiceKind::Business,
             prefix: "svc".into(),
             base_url: "http://localhost:1234/".into(),
+            runner_urls: vec!["http://localhost:1234".into()],
             allowed_get_endpoints: Default::default(),
             queue_listeners: Vec::new(),
             schedules: Vec::new(),
             memory_limit_mb: None,
+            runner_instances: 1,
         };
 
         assert_eq!(healthcheck_url(&service), "http://localhost:1234/health");
@@ -117,10 +119,12 @@ mod tests {
             kind: ServiceKind::Business,
             prefix: "svc".into(),
             base_url: "http://localhost:1234".into(),
+            runner_urls: vec!["http://localhost:1234".into()],
             allowed_get_endpoints: Default::default(),
             queue_listeners: Vec::new(),
             schedules: Vec::new(),
             memory_limit_mb: None,
+            runner_instances: 1,
         };
 
         let health = start_health_monitor(&[service.clone()]);

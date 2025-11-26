@@ -8,10 +8,11 @@ un sondeo periódico (`/health`) para cada servicio configurado.
 
 * **Carga de servicios**: se leen los manifiestos y la configuración JSON situada en
   `services/<nombre>/config/service.json`.
-* **Arranque supervisado**: los servicios se levantan usando `cargo run` y se espera a que el
-  puerto quede accesible antes de continuar.
+* **Arranque supervisado**: los servicios se levantan usando `cargo run`, respetando el número de
+  runners configurado para cada módulo y esperando a que el puerto asignado quede accesible antes
+  de continuar.
 * **Proxy HTTP**: las peticiones entrantes se enrutan según el prefijo definido para cada
-  servicio.
+  servicio y se balancean en round-robin entre las copias activas.
 * **Panel web**: en `http://127.0.0.1:14000` se genera un resumen dinámico con el estado de
   salud, consumo de memoria y actividades de las integraciones.
 * **Webhooks programados**: los servicios pueden solicitar que wasmrunner invoque ciertos endpoints
